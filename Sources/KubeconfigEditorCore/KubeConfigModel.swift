@@ -196,8 +196,10 @@ public final class KubeConfigViewModel: ObservableObject {
         suppressHistoryTracking = true
         let fileSession = sessionKey(for: url)
         let workspaceURL = workspaceFileURL(for: url)
+        let legacyWorkspaceURL = legacyWorkspaceFileURL(for: url)
         let manager = FileManager.default
         let workspaceExists = manager.fileExists(atPath: workspaceURL.path)
+        let legacyWorkspaceExists = manager.fileExists(atPath: legacyWorkspaceURL.path)
         let detachedStoreExists = manager.fileExists(atPath: detachedStoreURL(for: url).path)
         let recoveredWorkspace = workspaceExists ? nil : tryLoadLatestWorkspaceSnapshot(for: url, sessionKey: fileSession)
         let useRecoveredWorkspace: Bool = {
@@ -208,7 +210,7 @@ public final class KubeConfigViewModel: ObservableObject {
             // If detached store exists, prefer it over old history snapshots without workspace metadata.
             return !detachedStoreExists
         }()
-        let sourceURL = workspaceExists ? workspaceURL : url
+        let sourceURL = workspaceExists ? workspaceURL : (legacyWorkspaceExists ? legacyWorkspaceURL : url)
         let text: String
         if useRecoveredWorkspace, let recoveredWorkspace {
             text = recoveredWorkspace
@@ -233,7 +235,7 @@ public final class KubeConfigViewModel: ObservableObject {
         rootExtras.removeValue(forKey: "users")
         rootExtras.removeValue(forKey: "current-context")
 
-        if workspaceExists || useRecoveredWorkspace {
+        if workspaceExists || legacyWorkspaceExists || useRecoveredWorkspace {
             applyWorkspaceExportFlags(from: text)
         } else {
             // Backward-compatibility with old detached store before workspace sidecar existed.
@@ -253,6 +255,9 @@ public final class KubeConfigViewModel: ObservableObject {
         let workspaceYAML = try buildWorkspaceYAML()
         if !workspaceExists {
             try writeWorkspaceFile(for: url, contents: workspaceYAML)
+            if legacyWorkspaceExists {
+                try? manager.removeItem(at: legacyWorkspaceURL)
+            }
         }
         try createDraftFile(fromYAML: workspaceYAML)
         try? syncGitWorkingTree(yaml: workspaceYAML)
@@ -1277,6 +1282,13 @@ public final class KubeConfigViewModel: ObservableObject {
     }
 
     private func workspaceFileURL(for kubeconfigURL: URL) -> URL {
+        let workspaceName = "\(sessionKey(for: kubeconfigURL)).kce.yaml"
+        return appSupportDirectoryURL
+            .appendingPathComponent("workspaces", isDirectory: true)
+            .appendingPathComponent(workspaceName)
+    }
+
+    private func legacyWorkspaceFileURL(for kubeconfigURL: URL) -> URL {
         let baseName = kubeconfigURL.lastPathComponent
         let workspaceName = ".\(baseName).kce.yaml"
         return kubeconfigURL.deletingLastPathComponent().appendingPathComponent(workspaceName)
@@ -1285,6 +1297,8 @@ public final class KubeConfigViewModel: ObservableObject {
     private func writeWorkspaceFile(for kubeconfigURL: URL, contents: String? = nil) throws {
         let workspaceURL = workspaceFileURL(for: kubeconfigURL)
         let yaml = try contents ?? buildWorkspaceYAML()
+        let dir = workspaceURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         try yaml.write(to: workspaceURL, atomically: true, encoding: .utf8)
     }
 

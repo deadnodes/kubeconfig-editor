@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Testing
 @testable import KubeconfigEditorCore
@@ -404,9 +405,17 @@ struct KubeConfigViewModelTests {
     }
 
     private func workspaceURL(for kubeconfigURL: URL) -> URL {
-        kubeconfigURL
-            .deletingLastPathComponent()
-            .appendingPathComponent(".\(kubeconfigURL.lastPathComponent).kce.yaml")
+        let canonical = kubeconfigURL.standardizedFileURL.resolvingSymlinksInPath().path
+        let digest = SHA256.hash(data: Data(canonical.utf8))
+        let hex = digest.map { String(format: "%02x", $0) }.joined()
+        let sessionKey = "file-\(hex.prefix(16))"
+
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library")
+            .appendingPathComponent("Application Support")
+            .appendingPathComponent("KubeconfigEditor")
+            .appendingPathComponent("workspaces")
+            .appendingPathComponent("\(sessionKey).kce.yaml")
     }
 }
 

@@ -4,6 +4,15 @@ All notable changes to this project are documented in this file.
 
 The format follows Keep a Changelog and semantic versioning.
 
+## [0.0.9] - 2026-02-27
+
+### Changed
+- Moved workspace sidecar storage from kubeconfig directory to `~/Library/Application Support/KubeconfigEditor/workspaces/` to isolate app-internal files from external kubeconfig scanners.
+
+### Fixed
+- Added automatic migration from legacy local sidecar files (`.<kubeconfig>.kce.yaml`) to the new isolated workspace location.
+- Removed duplicated kubeconfig entries in Lens caused by synced legacy sidecar files in `~/.kube`.
+
 ## [0.0.8] - 2026-02-27
 
 ### Changed
