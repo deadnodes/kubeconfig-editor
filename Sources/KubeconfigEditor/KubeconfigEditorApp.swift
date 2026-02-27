@@ -27,6 +27,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 @main
 struct KubeconfigEditorApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    @AppStorage("kce.autoValidateYAML") private var autoValidateYAML = true
 
     var body: some Scene {
         WindowGroup {
@@ -35,12 +36,14 @@ struct KubeconfigEditorApp: App {
         .defaultSize(width: 1320, height: 820)
         .windowStyle(.hiddenTitleBar)
         .commands {
-            FileMenuCommands()
+            FileMenuCommands(autoValidateYAML: $autoValidateYAML)
         }
     }
 }
 
 struct FileMenuCommands: Commands {
+    @Binding var autoValidateYAML: Bool
+
     var body: some Commands {
         CommandGroup(after: .appInfo) {
             Button("Updates...") {
@@ -88,6 +91,10 @@ struct FileMenuCommands: Commands {
                 NotificationCenter.default.post(name: AppMenuCommand.import, object: nil)
             }
             .keyboardShortcut("i", modifiers: [.command, .shift])
+
+            Divider()
+
+            Toggle("Auto Validate YAML", isOn: $autoValidateYAML)
         }
     }
 }

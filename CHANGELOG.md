@@ -4,6 +4,22 @@ All notable changes to this project are documented in this file.
 
 The format follows Keep a Changelog and semantic versioning.
 
+## [0.0.10] - 2026-02-27
+
+### Added
+- Added sidebar radio controls for contexts to switch `current-context` directly from the list.
+- Added dedicated `Add / Import` button in the sidebar for create/import actions.
+
+### Changed
+- Updated controls to a cleaner glass-like system look with unified button styling across the main workspace actions.
+- Simplified long action labels in the top bar (`Merge`, `Set Current`, `Export`) for cleaner visual rhythm.
+- Moved `Auto Validate YAML` from the top action bar into the macOS `File` menu (toggle with checkmark, VSCode-like behavior).
+- Selecting a context via radio now immediately updates `current-context` and saves kubeconfig.
+- Active context now has stronger visual affordance in the list: subtle row highlight + bold title.
+
+### Fixed
+- Improved toolbar action layout by removing the noisy plus-menu capsule and moving primary create/import entry to the sidebar.
+
 ## [0.0.9] - 2026-02-27
 
 ### Changed

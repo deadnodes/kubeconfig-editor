@@ -11,6 +11,7 @@ enum WorkspaceSection: String, CaseIterable {
 struct AppView: View {
     @StateObject private var viewModel = KubeConfigViewModel()
     @StateObject private var updater = ReleaseUpdater()
+    @AppStorage("kce.autoValidateYAML") private var autoValidateYAML = true
     @State private var didTryDefaultLoad = false
     @State private var section: WorkspaceSection = .contexts
 
@@ -20,6 +21,7 @@ struct AppView: View {
     @State private var importPrefix = ""
     @State private var importReplaceHost = ""
     @State private var importMessage = ""
+    @State private var showCreateMenuDialog = false
     @State private var showBulkDeleteDialog = false
     @State private var showVersionsSheet = false
     @State private var savedVersions: [KubeConfigViewModel.SavedVersion] = []
@@ -71,7 +73,7 @@ struct AppView: View {
         }
         .frame(minWidth: 1200, minHeight: 760)
         .toolbar {
-            ToolbarItemGroup(placement: .navigation) {
+            ToolbarItem(placement: .navigation) {
                 Picker("Section", selection: $section) {
                     Text("Contexts").tag(WorkspaceSection.contexts)
                     Text("Clusters").tag(WorkspaceSection.clusters)
@@ -79,35 +81,8 @@ struct AppView: View {
                 }
                 .pickerStyle(.segmented)
                 .frame(width: 300)
-
-                Menu {
-                    Button("New Context") {
-                        viewModel.addContext()
-                        section = .contexts
-                        adoptSelectionFromViewModel()
-                    }
-                    Button("New Cluster") {
-                        viewModel.addCluster()
-                        section = .clusters
-                        adoptSelectionFromViewModel()
-                    }
-                    Button("New User") {
-                        viewModel.addUser()
-                        section = .users
-                        adoptSelectionFromViewModel()
-                    }
-                    Divider()
-                    Button("Import as New Entries...") {
-                        showImportSheet = true
-                    }
-                    Button("Quick Add AWS EKS...") {
-                        showAwsEksQuickAddSheet = true
-                    }
-                } label: {
-                    Image(systemName: "plus.circle.fill")
-                        .font(.title3)
-                }
             }
+
         }
         .safeAreaInset(edge: .bottom) {
             HStack {
@@ -142,9 +117,13 @@ struct AppView: View {
         .onAppear {
             guard !didTryDefaultLoad else { return }
             didTryDefaultLoad = true
+            viewModel.setBackgroundValidation(autoValidateYAML)
             viewModel.loadDefaultKubeconfigIfExists()
             ensureSelectionForCurrentSection()
             updater.checkForUpdatesIfNeeded()
+        }
+        .onChange(of: autoValidateYAML) { enabled in
+            viewModel.setBackgroundValidation(enabled)
         }
         .onReceive(NotificationCenter.default.publisher(for: AppMenuCommand.newConfig)) { _ in
             viewModel.newEmpty()
@@ -240,6 +219,31 @@ struct AppView: View {
         } message: {
             Text("Каскад удалит связанные сущности, которые больше нигде не используются.")
         }
+        .confirmationDialog("Create or Import", isPresented: $showCreateMenuDialog, titleVisibility: .visible) {
+            Button("New Context") {
+                viewModel.addContext()
+                section = .contexts
+                adoptSelectionFromViewModel()
+            }
+            Button("New Cluster") {
+                viewModel.addCluster()
+                section = .clusters
+                adoptSelectionFromViewModel()
+            }
+            Button("New User") {
+                viewModel.addUser()
+                section = .users
+                adoptSelectionFromViewModel()
+            }
+            Divider()
+            Button("Import as New Entries...") {
+                showImportSheet = true
+            }
+            Button("Quick Add AWS EKS...") {
+                showAwsEksQuickAddSheet = true
+            }
+            Button("Cancel", role: .cancel) {}
+        }
         .sheet(isPresented: $showVersionsSheet) {
             VersionsSheet(
                 versions: savedVersions,
@@ -317,6 +321,16 @@ struct AppView: View {
             .padding(.horizontal, 10)
             .padding(.top, 8)
 
+            Button {
+                showCreateMenuDialog = true
+            } label: {
+                Label("Add / Import", systemImage: "plus")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(GlassPrimaryPillButtonStyle())
+            .controlSize(.regular)
+            .padding(.horizontal, 10)
+
             List {
                 switch section {
                 case .contexts:
@@ -326,9 +340,12 @@ struct AppView: View {
                                 title: context.name,
                                 warning: viewModel.contextWarning(context),
                                 includeInExport: context.includeInExport,
-                                isSelected: selectedContextIDs.contains(context.id)
+                                isSelected: selectedContextIDs.contains(context.id),
+                                isCurrent: viewModel.currentContext == context.name
                             ) {
                                 handleContextClick(context.id)
+                            } onSetCurrent: {
+                                activateContextFromSidebar(context.id)
                             } onToggleExport: {
                                 viewModel.toggleContextExport(context.id)
                             } onDelete: {
@@ -435,23 +452,20 @@ struct AppView: View {
             Button("Open File...") { openFile() }
             Button("Save") { save() }
             Button("Save As...") { saveAs() }
-            Toggle("Auto Validate YAML", isOn: Binding(
-                get: { viewModel.backgroundValidationEnabled },
-                set: { viewModel.setBackgroundValidation($0) }
-            ))
-            .toggleStyle(.switch)
-            .frame(maxWidth: 190)
 
             Divider().frame(height: 20)
 
             switch section {
             case .contexts:
-                Button("Merge into Selected Context...") { openContextMergeSheetAction() }
+                Button("Merge") { openContextMergeSheetAction() }
+                    .help("Merge into selected context")
                     .disabled(currentMergeTargetContextID() == nil)
-                Button("Set as Current + Save") { makeCurrentAndSave() }
+                Button("Set Current") { makeCurrentAndSave() }
+                    .help("Set as current context and save")
                     .disabled(currentMergeTargetContextID() == nil)
                 if selectedContextIDs.count >= 1 {
-                    Button("Export Selected...") { exportSelectedContexts() }
+                    Button("Export") { exportSelectedContexts() }
+                        .help("Export selected contexts")
                 }
                 if selectedContextIDs.count > 1 {
                     Button("Удалить выбранное") { requestDeleteSelectedBulk() }
@@ -478,7 +492,7 @@ struct AppView: View {
                 Button("Create Backup") { backup() }
             }
         }
-        .buttonStyle(.bordered)
+        .buttonStyle(GlassToolbarButtonStyle())
         .controlSize(.small)
     }
 
@@ -522,8 +536,7 @@ struct AppView: View {
                         Button("Remove") {
                             openRemoveDialog(.context(viewModel.contexts[index].id))
                         }
-                        .buttonStyle(.borderedProminent)
-                        .tint(.red)
+                        .buttonStyle(GlassDestructiveButtonStyle())
                     }
                 }
                 .padding()
@@ -567,8 +580,7 @@ struct AppView: View {
                         Button("Remove") {
                             openRemoveDialog(.cluster(viewModel.clusters[index].id))
                         }
-                        .buttonStyle(.borderedProminent)
-                        .tint(.red)
+                        .buttonStyle(GlassDestructiveButtonStyle())
                     }
                 }
                 .padding()
@@ -612,8 +624,7 @@ struct AppView: View {
                         Button("Remove") {
                             openRemoveDialog(.user(viewModel.users[index].id))
                         }
-                        .buttonStyle(.borderedProminent)
-                        .tint(.red)
+                        .buttonStyle(GlassDestructiveButtonStyle())
                     }
                 }
                 .padding()
@@ -650,10 +661,11 @@ struct AppView: View {
     }
 
     @ViewBuilder
-    private func sidebarRow(title: String, warning: String?, includeInExport: Bool) -> some View {
+    private func sidebarRow(title: String, warning: String?, includeInExport: Bool, isCurrent: Bool = false) -> some View {
         HStack(spacing: 8) {
             Text(title)
                 .lineLimit(1)
+                .fontWeight(isCurrent ? .bold : .regular)
                 .foregroundColor(warning == nil ? (includeInExport ? .primary : .secondary) : .red)
             if let warning {
                 Image(systemName: "exclamationmark.triangle.fill")
@@ -675,14 +687,26 @@ struct AppView: View {
         warning: String?,
         includeInExport: Bool,
         isSelected: Bool,
+        isCurrent: Bool = false,
         action: @escaping () -> Void,
+        onSetCurrent: (() -> Void)? = nil,
         onToggleExport: @escaping () -> Void,
         onDelete: (() -> Void)? = nil
     ) -> some View {
         HStack(spacing: 8) {
+            if let onSetCurrent {
+                Button {
+                    onSetCurrent()
+                } label: {
+                    Image(systemName: isCurrent ? "checkmark.circle.fill" : "circle")
+                        .foregroundColor(isCurrent ? .accentColor : .secondary)
+                }
+                .buttonStyle(.plain)
+                .help(isCurrent ? "Current context" : "Set as current context and save")
+            }
             Button(action: action) {
                 HStack(spacing: 0) {
-                    sidebarRow(title: title, warning: warning, includeInExport: includeInExport)
+                    sidebarRow(title: title, warning: warning, includeInExport: includeInExport, isCurrent: isCurrent)
                     Spacer(minLength: 0)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -702,13 +726,29 @@ struct AppView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
-        .listRowBackground(isSelected ? Color.accentColor.opacity(0.35) : Color.clear)
+        .listRowBackground(
+            isSelected
+                ? Color.accentColor.opacity(0.35)
+                : (isCurrent ? Color.accentColor.opacity(0.14) : Color.clear)
+        )
         .contextMenu {
             if let onDelete {
                 Button("Delete", role: .destructive) {
                     onDelete()
                 }
             }
+        }
+    }
+
+    private func activateContextFromSidebar(_ id: UUID) {
+        selectedContextIDs = [id]
+        selectedClusterIDs = []
+        selectedUserIDs = []
+        syncEnumSelection()
+        do {
+            try viewModel.activateContextAndSave(id)
+        } catch {
+            viewModel.statusMessage = "Не удалось активировать context: \(error.localizedDescription)"
         }
     }
 
@@ -1337,6 +1377,65 @@ struct KeyValueEditor: View {
                 fields.append(KeyValueField(key: "", value: ""))
             }
         }
+    }
+}
+
+private struct GlassToolbarButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 12, weight: .semibold))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(.ultraThinMaterial.opacity(configuration.isPressed ? 0.55 : 0.36))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(Color.white.opacity(configuration.isPressed ? 0.22 : 0.14), lineWidth: 1)
+            )
+            .scaleEffect(configuration.isPressed ? 0.985 : 1.0)
+    }
+}
+
+private struct GlassPrimaryPillButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 13, weight: .semibold))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(.regularMaterial)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(Color.accentColor.opacity(configuration.isPressed ? 0.22 : 0.16))
+                    )
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(Color.white.opacity(0.16), lineWidth: 1)
+            )
+            .scaleEffect(configuration.isPressed ? 0.985 : 1.0)
+    }
+}
+
+private struct GlassDestructiveButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundColor(.white)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(Color.red.opacity(configuration.isPressed ? 0.78 : 0.68))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(Color.white.opacity(0.15), lineWidth: 1)
+            )
+            .scaleEffect(configuration.isPressed ? 0.985 : 1.0)
     }
 }
 

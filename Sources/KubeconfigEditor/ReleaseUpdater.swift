@@ -33,9 +33,10 @@ final class ReleaseUpdater: ObservableObject {
     private var periodicCheckTask: Task<Void, Never>?
     private let owner = "deadnodes"
     private let repo = "kubeconfig-editor"
+    private let installedVersionDefaultsKey = "kce.installedVersion"
 
     init() {
-        if let version = appVersion() {
+        if let version = effectiveCurrentVersion() {
             currentVersion = version
         }
     }
@@ -62,7 +63,7 @@ final class ReleaseUpdater: ObservableObject {
             installStatus = "Update check works only from installed .app bundle"
             return
         }
-        guard let currentVersion = appVersion() else { return }
+        guard let currentVersion = effectiveCurrentVersion() else { return }
         self.currentVersion = currentVersion
         availableUpdate = nil
 
@@ -110,9 +111,9 @@ final class ReleaseUpdater: ObservableObject {
             installStatus = "Auto-update works only from installed .app bundle"
             return
         }
-        guard let liveVersion = appVersion(), isVersion(update.version, newerThan: liveVersion) else {
+        guard let liveVersion = effectiveCurrentVersion(), isVersion(update.version, newerThan: liveVersion) else {
             availableUpdate = nil
-            installStatus = "You are up to date (\(appVersion() ?? currentVersion))"
+            installStatus = "You are up to date (\(effectiveCurrentVersion() ?? currentVersion))"
             return
         }
         self.currentVersion = liveVersion
@@ -120,6 +121,7 @@ final class ReleaseUpdater: ObservableObject {
         installStatus = "Installing update..."
 
         do {
+            rememberInstalledVersion(update.version)
             try scheduleDownloadAndReplaceAndRestart(update: update)
             terminateForUpdateInstall()
         } catch {
@@ -147,6 +149,37 @@ final class ReleaseUpdater: ObservableObject {
             return normalizedVersion(version)
         }
         return nil
+    }
+
+    private func storedInstalledVersion() -> String? {
+        guard let raw = UserDefaults.standard.string(forKey: installedVersionDefaultsKey) else { return nil }
+        let value = normalizedVersion(raw)
+        return value.isEmpty ? nil : value
+    }
+
+    private func rememberInstalledVersion(_ version: String) {
+        let normalized = normalizedVersion(version)
+        guard !normalized.isEmpty else { return }
+        UserDefaults.standard.set(normalized, forKey: installedVersionDefaultsKey)
+    }
+
+    private func effectiveCurrentVersion() -> String? {
+        let bundleVersion = appVersion()
+        let storedVersion = storedInstalledVersion()
+
+        switch (bundleVersion, storedVersion) {
+        case let (bundle?, stored?):
+            let effective = isVersion(stored, newerThan: bundle) ? stored : bundle
+            rememberInstalledVersion(effective)
+            return effective
+        case let (bundle?, nil):
+            rememberInstalledVersion(bundle)
+            return bundle
+        case let (nil, stored?):
+            return stored
+        case (nil, nil):
+            return nil
+        }
     }
 
     private func fetchLatestRelease() async throws -> GitHubRelease {
