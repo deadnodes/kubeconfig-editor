@@ -222,6 +222,9 @@ struct AppView: View {
                     } catch {
                         importMessage = "Ошибка merge: \(error.localizedDescription)"
                     }
+                },
+                onClose: {
+                    showImportSheet = false
                 }
             )
             .frame(minWidth: 980, minHeight: 700)
@@ -1297,19 +1300,35 @@ struct KeyValueEditor: View {
         self.excludedKeys = Set(excludedKeys)
     }
 
+    private var visibleFieldIndices: [Int] {
+        fields.indices.filter { !excludedKeys.contains(fields[$0].key) }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            ForEach($fields) { $field in
-                if !excludedKeys.contains(field.key) {
-                    HStack {
-                        TextField("Field key", text: $field.key)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 250)
-                        TextField("Field value", text: $field.value, axis: .vertical)
-                            .textFieldStyle(.roundedBorder)
-                        Button("Remove") {
-                            fields.removeAll { $0.id == field.id }
-                        }
+            if !visibleFieldIndices.isEmpty {
+                HStack {
+                    Text("Key")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 250, alignment: .leading)
+                    Text("Value")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+            }
+
+            ForEach(visibleFieldIndices, id: \.self) { index in
+                HStack(alignment: .top, spacing: 8) {
+                    TextField("", text: $fields[index].key)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 250)
+                    TextField("", text: $fields[index].value, axis: .vertical)
+                        .textFieldStyle(.roundedBorder)
+                    Button("Remove") {
+                        let id = fields[index].id
+                        fields.removeAll { $0.id == id }
                     }
                 }
             }
@@ -1534,11 +1553,19 @@ struct AwsEksQuickAddSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
+                Button {
+                    onClose()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.title3)
+                }
+                .buttonStyle(.plain)
+                .keyboardShortcut(.cancelAction)
+                .help("Close")
+
                 Text("Quick Add AWS EKS")
                     .font(.title3)
                 Spacer()
-                Button("Close") { onClose() }
-                    .buttonStyle(.borderedProminent)
             }
 
             Divider()
@@ -1594,11 +1621,24 @@ struct ImportSnippetSheet: View {
 
     var onPreview: () -> Void
     var onMerge: () -> Void
+    var onClose: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Import Kubeconfig as New Entries")
-                .font(.title3)
+            HStack(spacing: 10) {
+                Button {
+                    onClose()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.title3)
+                }
+                .buttonStyle(.plain)
+                .keyboardShortcut(.cancelAction)
+                .help("Close")
+
+                Text("Import Kubeconfig as New Entries")
+                    .font(.title3)
+            }
 
             HStack {
                 TextField("Name prefix (optional)", text: $prefix)

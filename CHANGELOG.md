@@ -4,6 +4,15 @@ All notable changes to this project are documented in this file.
 
 The format follows Keep a Changelog and semantic versioning.
 
+## [0.0.8] - 2026-02-27
+
+### Changed
+- Made field editing UI more compact: removed repeated per-row `Field key`/`Field value` labels and switched to shared `Key`/`Value` column headers.
+
+### Fixed
+- Added explicit top-left close control for `Import Kubeconfig as New Entries` sheet.
+- Added explicit top-left close control for `Quick Add AWS EKS` sheet and removed duplicate right-side close action.
+
 ## [0.0.7] - 2026-02-27
 
 ### Added
