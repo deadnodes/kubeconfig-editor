@@ -564,6 +564,104 @@ public final class KubeConfigViewModel: ObservableObject {
         triggerBackgroundValidationIfNeeded()
     }
 
+    public func addAWSEKSContext(
+        contextName: String,
+        clusterArn: String,
+        endpoint: String,
+        certificateAuthorityData: String,
+        region: String,
+        awsProfile: String
+    ) throws {
+        let cleanArn = clusterArn.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanEndpoint = endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanCA = certificateAuthorityData.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanRegion = region.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanProfile = awsProfile.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !cleanArn.isEmpty else {
+            throw NSError(domain: "KubeconfigEditor", code: 1030, userInfo: [NSLocalizedDescriptionKey: "Cluster ARN is required"])
+        }
+        guard !cleanEndpoint.isEmpty else {
+            throw NSError(domain: "KubeconfigEditor", code: 1031, userInfo: [NSLocalizedDescriptionKey: "API server endpoint is required"])
+        }
+        guard !cleanRegion.isEmpty else {
+            throw NSError(domain: "KubeconfigEditor", code: 1032, userInfo: [NSLocalizedDescriptionKey: "AWS region is required"])
+        }
+
+        let clusterNameFromArn = eksClusterName(fromArn: cleanArn) ?? "eks-cluster"
+        let baseContextName: String
+        let cleanedContextName = contextName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if cleanedContextName.isEmpty {
+            baseContextName = clusterNameFromArn
+        } else {
+            baseContextName = cleanedContextName
+        }
+
+        let clusterRefName = uniqueName(base: cleanArn, in: clusters)
+        let userRefName = uniqueName(base: cleanArn, in: users)
+        let contextRefName = uniqueName(base: baseContextName, in: contexts)
+
+        var clusterFields: [KeyValueField] = [
+            KeyValueField(key: "server", value: cleanEndpoint)
+        ]
+        if !cleanCA.isEmpty {
+            clusterFields.append(KeyValueField(key: "certificate-authority-data", value: cleanCA))
+        }
+
+        let execArgs: [Any] = [
+            "--region", cleanRegion,
+            "eks", "get-token",
+            "--cluster-name", clusterNameFromArn,
+            "--output", "json"
+        ]
+        var execObject: [String: Any] = [
+            "apiVersion": "client.authentication.k8s.io/v1beta1",
+            "command": "aws",
+            "args": execArgs,
+            "interactiveMode": "IfAvailable",
+            "provideClusterInfo": false
+        ]
+        if !cleanProfile.isEmpty {
+            execObject["env"] = [
+                [
+                    "name": "AWS_PROFILE",
+                    "value": cleanProfile
+                ]
+            ]
+        }
+        let execValue = anyToString(execObject)
+
+        let clusterItem = NamedItem(
+            name: clusterRefName,
+            fields: clusterFields,
+            includeInExport: true
+        )
+        let userItem = NamedItem(
+            name: userRefName,
+            fields: [KeyValueField(key: "exec", value: execValue)],
+            includeInExport: true
+        )
+        let contextItem = NamedItem(
+            name: contextRefName,
+            fields: [
+                KeyValueField(key: "cluster", value: clusterRefName),
+                KeyValueField(key: "user", value: userRefName)
+            ],
+            includeInExport: true
+        )
+
+        clusters.append(clusterItem)
+        users.append(userItem)
+        contexts.append(contextItem)
+
+        selection = .context(contextItem.id)
+        if currentContext.isEmpty {
+            currentContext = contextItem.name
+        }
+        statusMessage = "AWS EKS context added: \(contextItem.name)"
+        triggerBackgroundValidationIfNeeded()
+    }
+
     public func deleteSelected() {
         guard let selection else { return }
 
@@ -1791,6 +1889,13 @@ public final class KubeConfigViewModel: ObservableObject {
         }
         used.insert(candidate)
         return candidate
+    }
+
+    private func eksClusterName(fromArn arn: String) -> String? {
+        let marker = "cluster/"
+        guard let range = arn.range(of: marker) else { return nil }
+        let name = String(arn[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? nil : name
     }
 
     private func projectedForExport() -> ExportProjection {

@@ -37,10 +37,18 @@ struct AppView: View {
     @State private var pendingRemoveTarget: RemoveTarget?
     @State private var showRemoveConfirmSheet = false
     @State private var showUpdatesSheet = false
+    @State private var showAwsEksQuickAddSheet = false
     @State private var listSearchText = ""
     @State private var listSortAscending = true
     @State private var isStartingUpdateInstall = false
     @State private var isLoadingVersionHistory = false
+    @State private var awsEksContextName = ""
+    @State private var awsEksClusterArn = ""
+    @State private var awsEksEndpoint = ""
+    @State private var awsEksCertificateAuthorityData = ""
+    @State private var awsEksRegion = "eu-central-1"
+    @State private var awsEksProfile = ""
+    @State private var awsEksMessage = ""
 
     var body: some View {
         NavigationSplitView {
@@ -91,6 +99,9 @@ struct AppView: View {
                     Divider()
                     Button("Import as New Entries...") {
                         showImportSheet = true
+                    }
+                    Button("Quick Add AWS EKS...") {
+                        showAwsEksQuickAddSheet = true
                     }
                 } label: {
                     Image(systemName: "plus.circle.fill")
@@ -271,6 +282,20 @@ struct AppView: View {
                 onClose: { showUpdatesSheet = false }
             )
             .frame(minWidth: 520, minHeight: 300)
+        }
+        .sheet(isPresented: $showAwsEksQuickAddSheet) {
+            AwsEksQuickAddSheet(
+                contextName: $awsEksContextName,
+                clusterArn: $awsEksClusterArn,
+                endpoint: $awsEksEndpoint,
+                certificateAuthorityData: $awsEksCertificateAuthorityData,
+                region: $awsEksRegion,
+                awsProfile: $awsEksProfile,
+                message: $awsEksMessage,
+                onAdd: { addAwsEksQuickContext() },
+                onClose: { showAwsEksQuickAddSheet = false }
+            )
+            .frame(minWidth: 880, minHeight: 620)
         }
     }
 
@@ -781,6 +806,30 @@ struct AppView: View {
             } catch {
                 viewModel.statusMessage = "Ошибка чтения версий: \(error.localizedDescription)"
             }
+        }
+    }
+
+    private func addAwsEksQuickContext() {
+        do {
+            try viewModel.addAWSEKSContext(
+                contextName: awsEksContextName,
+                clusterArn: awsEksClusterArn,
+                endpoint: awsEksEndpoint,
+                certificateAuthorityData: awsEksCertificateAuthorityData,
+                region: awsEksRegion,
+                awsProfile: awsEksProfile
+            )
+            section = .contexts
+            adoptSelectionFromViewModel()
+            awsEksMessage = "AWS EKS context created"
+            showAwsEksQuickAddSheet = false
+            awsEksContextName = ""
+            awsEksClusterArn = ""
+            awsEksEndpoint = ""
+            awsEksCertificateAuthorityData = ""
+            awsEksProfile = ""
+        } catch {
+            awsEksMessage = "Ошибка создания AWS EKS context: \(error.localizedDescription)"
         }
     }
 
@@ -1467,6 +1516,72 @@ struct UpdatesSheet: View {
             Spacer()
         }
         .padding(14)
+    }
+}
+
+struct AwsEksQuickAddSheet: View {
+    @Binding var contextName: String
+    @Binding var clusterArn: String
+    @Binding var endpoint: String
+    @Binding var certificateAuthorityData: String
+    @Binding var region: String
+    @Binding var awsProfile: String
+    @Binding var message: String
+
+    var onAdd: () -> Void
+    var onClose: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Quick Add AWS EKS")
+                    .font(.title3)
+                Spacer()
+                Button("Close") { onClose() }
+                    .buttonStyle(.borderedProminent)
+            }
+
+            Divider()
+
+            GroupBox("Required") {
+                VStack(alignment: .leading, spacing: 10) {
+                    TextField("Cluster ARN (arn:aws:eks:region:account:cluster/name)", text: $clusterArn)
+                    TextField("API server endpoint (https://...eks.amazonaws.com)", text: $endpoint)
+                    TextField("AWS region (e.g. eu-central-1)", text: $region)
+                }
+                .textFieldStyle(.roundedBorder)
+            }
+
+            GroupBox("Optional") {
+                VStack(alignment: .leading, spacing: 10) {
+                    TextField("Context name (default: cluster name from ARN)", text: $contextName)
+                    TextField("AWS profile for exec env (AWS_PROFILE)", text: $awsProfile)
+                    Text("certificate-authority-data")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    TextEditor(text: $certificateAuthorityData)
+                        .font(.system(.body, design: .monospaced))
+                        .frame(minHeight: 120)
+                        .border(.quaternary)
+                }
+                .textFieldStyle(.roundedBorder)
+            }
+
+            if !message.isEmpty {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack {
+                Spacer()
+                Button("Create AWS EKS Context") {
+                    onAdd()
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(16)
     }
 }
 

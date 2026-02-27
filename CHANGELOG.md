@@ -4,6 +4,15 @@ All notable changes to this project are documented in this file.
 
 The format follows Keep a Changelog and semantic versioning.
 
+## [0.0.7] - 2026-02-27
+
+### Added
+- Added a dedicated `Quick Add AWS EKS` flow in the UI to create AWS EKS context/cluster/user from structured fields.
+
+### Changed
+- AWS EKS quick-add now generates `exec` configuration with required arguments and optional `env` (`AWS_PROFILE`) automatically.
+- Test fixtures were sanitized to use mock AWS identifiers/profiles (`mock-eks`, `mock-aws-profile`).
+
 ## [0.0.6] - 2026-02-26
 
 ### Changed

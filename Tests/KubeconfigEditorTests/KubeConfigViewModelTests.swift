@@ -350,6 +350,36 @@ struct KubeConfigViewModelTests {
         #expect(normalizedVersion(" 1.2.3 ") == "1.2.3")
     }
 
+    @Test("quick add AWS EKS builds exec env with AWS_PROFILE")
+    func quickAddAwsEksBuildsExecEnvWithProfile() throws {
+        let vm = KubeConfigViewModel()
+
+        try vm.addAWSEKSContext(
+            contextName: "mock-eks",
+            clusterArn: "arn:aws:eks:eu-central-1:000000000000:cluster/mock-eks",
+            endpoint: "https://example.eks.amazonaws.com",
+            certificateAuthorityData: "LS0tTEST==",
+            region: "eu-central-1",
+            awsProfile: "mock-aws-profile"
+        )
+
+        let createdContext = try #require(vm.contexts.first(where: { $0.name.hasPrefix("mock-eks") }))
+        let clusterRef = createdContext.fieldValue("cluster")
+        let userRef = createdContext.fieldValue("user")
+        #expect(!clusterRef.isEmpty)
+        #expect(!userRef.isEmpty)
+
+        let createdUser = try #require(vm.users.first(where: { $0.name == userRef }))
+        let execPayload = createdUser.fieldValue("exec")
+        #expect(execPayload.contains("AWS_PROFILE"))
+        #expect(execPayload.contains("mock-aws-profile"))
+        #expect(execPayload.contains("provideClusterInfo"))
+
+        let createdCluster = try #require(vm.clusters.first(where: { $0.name == clusterRef }))
+        #expect(createdCluster.fieldValue("server") == "https://example.eks.amazonaws.com")
+        #expect(createdCluster.fieldValue("certificate-authority-data") == "LS0tTEST==")
+    }
+
     @Test("version compare handles semantic parts")
     func versionComparisonHandlesSemanticParts() {
         #expect(isVersion("1.2.4", newerThan: "1.2.3"))

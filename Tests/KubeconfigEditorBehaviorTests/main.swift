@@ -478,17 +478,17 @@ contexts:
       namespace: merged-ns
 """
 
-    static let awsExecNumericBoolYAML = """
+static let awsExecNumericBoolYAML = """
 apiVersion: v1
 kind: Config
 current-context: aws-ctx
 clusters:
-  - name: arn:aws:eks:eu-central-1:000000000000:cluster/stage-eks
+  - name: arn:aws:eks:eu-central-1:000000000000:cluster/mock-eks
     cluster:
       server: https://example.eks.amazonaws.com
       certificate-authority-data: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCg==
 users:
-  - name: arn:aws:eks:eu-central-1:000000000000:cluster/stage-eks
+  - name: arn:aws:eks:eu-central-1:000000000000:cluster/mock-eks
     user:
       exec:
         apiVersion: client.authentication.k8s.io/v1beta1
@@ -499,15 +499,15 @@ users:
           - eks
           - get-token
           - --cluster-name
-          - stage-eks
+          - mock-eks
           - --output
           - json
         provideClusterInfo: 0
 contexts:
   - name: aws-ctx
     context:
-      cluster: arn:aws:eks:eu-central-1:000000000000:cluster/stage-eks
-      user: arn:aws:eks:eu-central-1:000000000000:cluster/stage-eks
+      cluster: arn:aws:eks:eu-central-1:000000000000:cluster/mock-eks
+      user: arn:aws:eks:eu-central-1:000000000000:cluster/mock-eks
 """
 }
 
