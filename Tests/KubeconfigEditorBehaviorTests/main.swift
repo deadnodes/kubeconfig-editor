@@ -280,7 +280,7 @@ final class BehaviorRunner {
             }
         }
 
-        await test("legacy git history remains visible after key migration") {
+        await test("legacy local history repo is migrated to canonical store") {
             try withTempDir { dir in
                 let file = try writeFixture(dir: dir, name: "legacy-history.yaml", content: Fixtures.fixtureYAML)
                 let vm = KubeConfigViewModel()
@@ -293,20 +293,23 @@ final class BehaviorRunner {
                     .appendingPathComponent("KubeconfigEditor")
                     .appendingPathComponent("git-repos")
 
-                let legacyKey = legacySessionKey(file)
                 let localRepo = localHistoryRepo(file)
-                let legacyRepo = repoRoot.appendingPathComponent(legacyKey)
+                let canonicalRepo = repoRoot.appendingPathComponent(sessionKey(file))
 
-                if FileManager.default.fileExists(atPath: legacyRepo.path) {
-                    try? FileManager.default.removeItem(at: legacyRepo)
+                if FileManager.default.fileExists(atPath: localRepo.path) {
+                    try? FileManager.default.removeItem(at: localRepo)
+                }
+                if FileManager.default.fileExists(atPath: canonicalRepo.path) {
+                    try? FileManager.default.moveItem(at: canonicalRepo, to: localRepo)
                 }
                 try FileManager.default.createDirectory(at: repoRoot, withIntermediateDirectories: true)
-                try FileManager.default.moveItem(at: localRepo, to: legacyRepo)
 
                 let vm2 = KubeConfigViewModel()
                 try vm2.load(from: file)
                 let versions = try vm2.listSavedVersions()
-                try expect(!versions.isEmpty, "versions from legacy repo are visible")
+                try expect(!versions.isEmpty, "versions from migrated repo are visible")
+                try expect(FileManager.default.fileExists(atPath: canonicalRepo.path), "canonical repo exists")
+                try expect(!FileManager.default.fileExists(atPath: localRepo.path), "legacy local repo removed")
             }
         }
 
@@ -367,11 +370,6 @@ private func sessionKey(_ url: URL) -> String {
     let digest = SHA256.hash(data: Data(canonical.utf8))
     let hex = digest.map { String(format: "%02x", $0) }.joined()
     return "file-\(hex.prefix(16))"
-}
-
-private func legacySessionKey(_ url: URL) -> String {
-    let canonical = url.standardizedFileURL.resolvingSymlinksInPath().path
-    return canonical.replacingOccurrences(of: "/", with: "_")
 }
 
 private func localHistoryRepo(_ url: URL) -> URL {

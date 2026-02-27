@@ -195,6 +195,7 @@ public final class KubeConfigViewModel: ObservableObject {
     public func load(from url: URL) throws {
         suppressHistoryTracking = true
         let fileSession = sessionKey(for: url)
+        migrateLegacyLocalHistoryRepoIfNeeded(for: url)
         let workspaceURL = workspaceFileURL(for: url)
         let legacyWorkspaceURL = legacyWorkspaceFileURL(for: url)
         let manager = FileManager.default
@@ -255,9 +256,9 @@ public final class KubeConfigViewModel: ObservableObject {
         let workspaceYAML = try buildWorkspaceYAML()
         if !workspaceExists {
             try writeWorkspaceFile(for: url, contents: workspaceYAML)
-            if legacyWorkspaceExists {
-                try? manager.removeItem(at: legacyWorkspaceURL)
-            }
+        }
+        if legacyWorkspaceExists {
+            try? manager.removeItem(at: legacyWorkspaceURL)
         }
         try createDraftFile(fromYAML: workspaceYAML)
         try? syncGitWorkingTree(yaml: workspaceYAML)
@@ -1500,6 +1501,10 @@ public final class KubeConfigViewModel: ObservableObject {
     }
 
     private func localGitRepositoryURL(for kubeconfigURL: URL) -> URL {
+        gitRepositoryDirectory(for: sessionKey(for: kubeconfigURL))
+    }
+
+    private func legacyLocalGitRepositoryURL(for kubeconfigURL: URL) -> URL {
         let repoName = ".\(kubeconfigURL.lastPathComponent).kce-history.git"
         return kubeconfigURL.deletingLastPathComponent().appendingPathComponent(repoName, isDirectory: true)
     }
@@ -1523,37 +1528,8 @@ public final class KubeConfigViewModel: ObservableObject {
         gitRepositoryDirectory().appendingPathComponent(gitTrackedWorkspaceFilename())
     }
 
-    private func legacySessionKeys(for url: URL) -> [String] {
-        let raw = url.path
-        let standardized = url.standardizedFileURL.path
-        let canonical = url.standardizedFileURL.resolvingSymlinksInPath().path
-        let candidates = [raw, standardized, canonical]
-        var seen = Set<String>()
-        return candidates.compactMap { path in
-            let key = path.replacingOccurrences(of: "/", with: "_")
-            guard !key.isEmpty else { return nil }
-            guard seen.insert(key).inserted else { return nil }
-            return key
-        }
-    }
-
     private func gitRepositoryCandidates() -> [URL] {
-        var seen = Set<String>()
-        var result: [URL] = []
-
-        func add(_ url: URL) {
-            let key = url.standardizedFileURL.path
-            guard seen.insert(key).inserted else { return }
-            result.append(url)
-        }
-
-        add(gitRepositoryDirectory())
-        if let currentPath {
-            for legacyKey in legacySessionKeys(for: currentPath) {
-                add(gitRepositoryDirectory(for: legacyKey))
-            }
-        }
-        return result
+        [gitRepositoryDirectory()]
     }
 
     private func openGitRepository(createIfNeeded: Bool) throws -> Repository {
@@ -1615,25 +1591,31 @@ public final class KubeConfigViewModel: ObservableObject {
 
     private func tryLoadLatestWorkspaceSnapshot(for kubeconfigURL: URL, sessionKey: String) -> String? {
         let preferredFilename = workspaceFileURL(for: kubeconfigURL).lastPathComponent
-        var candidates: [URL] = [localGitRepositoryURL(for: kubeconfigURL)]
-        candidates.append(gitRepositoryDirectory(for: sessionKey))
-        for legacyKey in legacySessionKeys(for: kubeconfigURL) {
-            candidates.append(gitRepositoryDirectory(for: legacyKey))
-        }
-
-        var seen = Set<String>()
-        for repoDir in candidates {
-            let key = repoDir.standardizedFileURL.path
-            guard seen.insert(key).inserted else { continue }
-            guard let repository = try? Repository(at: repoDir, createIfNotExists: false) else { continue }
-            guard !repository.isHEADUnborn else { continue }
-            guard let commits = try? repository.log(sorting: [.time]) else { continue }
-            guard let latestCommit = commits.first(where: { _ in true }) else { continue }
-            if let text = try? workspaceYAMLFromCommit(latestCommit, in: repository, preferredFilename: preferredFilename) {
-                return text
-            }
+        let repoDir = gitRepositoryDirectory(for: sessionKey)
+        guard let repository = try? Repository(at: repoDir, createIfNotExists: false) else { return nil }
+        guard !repository.isHEADUnborn else { return nil }
+        guard let commits = try? repository.log(sorting: [.time]) else { return nil }
+        guard let latestCommit = commits.first(where: { _ in true }) else { return nil }
+        if let text = try? workspaceYAMLFromCommit(latestCommit, in: repository, preferredFilename: preferredFilename) {
+            return text
         }
         return nil
+    }
+
+    private func migrateLegacyLocalHistoryRepoIfNeeded(for kubeconfigURL: URL) {
+        let manager = FileManager.default
+        let legacyURL = legacyLocalGitRepositoryURL(for: kubeconfigURL)
+        guard manager.fileExists(atPath: legacyURL.path) else { return }
+
+        let canonicalURL = localGitRepositoryURL(for: kubeconfigURL)
+        try? manager.createDirectory(at: canonicalURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+
+        if manager.fileExists(atPath: canonicalURL.path) {
+            try? manager.removeItem(at: legacyURL)
+            return
+        }
+
+        try? manager.moveItem(at: legacyURL, to: canonicalURL)
     }
 
     private func workspaceYAMLFromCommit(_ commit: Commit, in repository: Repository, preferredFilename: String) throws -> String {

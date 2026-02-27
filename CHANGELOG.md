@@ -4,6 +4,13 @@ All notable changes to this project are documented in this file.
 
 The format follows Keep a Changelog and semantic versioning.
 
+## [0.0.11] - 2026-02-27
+
+### Fixed
+- Enforced a single source of truth for app workspace/history storage in `~/Library/Application Support/KubeconfigEditor` to avoid path drift across hosts.
+- Stopped using legacy local sidecar/history paths in `~/.kube` for runtime operations.
+- Added migration and cleanup for legacy `~/.kube/.config.kce.yaml` and `~/.kube/.config.kce-history.git` to prevent duplicated entries in Lens.
+
 ## [0.0.10] - 2026-02-27
 
 ### Added
