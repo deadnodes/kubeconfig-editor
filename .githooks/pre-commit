@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(git rev-parse --show-toplevel)"
+cd "$ROOT_DIR"
+
+SWIFT_BUILD_PATH="${SWIFT_BUILD_PATH:-.build-local}"
+case "$SWIFT_BUILD_PATH" in
+  /*) ;;
+  *) SWIFT_BUILD_PATH="$ROOT_DIR/$SWIFT_BUILD_PATH" ;;
+esac
+
+CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-$SWIFT_BUILD_PATH/clang-module-cache}"
+case "$CLANG_MODULE_CACHE_PATH" in
+  /*) ;;
+  *) CLANG_MODULE_CACHE_PATH="$ROOT_DIR/$CLANG_MODULE_CACHE_PATH" ;;
+esac
+
+mkdir -p "$SWIFT_BUILD_PATH" "$CLANG_MODULE_CACHE_PATH"
+export SWIFTPM_MODULECACHE_OVERRIDE="$CLANG_MODULE_CACHE_PATH"
+export CLANG_MODULE_CACHE_PATH="$CLANG_MODULE_CACHE_PATH"
+
+echo "[pre-commit] Lint manifests and scripts"
+swift package dump-package >/dev/null
+swift package describe >/dev/null
+bash -n scripts/package_dmg.sh
+
+echo "[pre-commit] Build"
+swift build --build-path "$SWIFT_BUILD_PATH"
+
+echo "[pre-commit] Unit tests"
+swift test --build-path "$SWIFT_BUILD_PATH"
+
+echo "[pre-commit] Behavior tests"
+swift run --build-path "$SWIFT_BUILD_PATH" KubeconfigEditorBehaviorTests
+
+echo "[pre-commit] OK"
