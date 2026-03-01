@@ -1,8 +1,39 @@
 import Foundation
 import Combine
 import CryptoKit
+import Darwin
 import Yams
 import SwiftGitX
+
+private final class KubeconfigFileWatcherHandle {
+    let url: URL
+    private let source: DispatchSourceFileSystemObject
+
+    init?(url: URL, queue: DispatchQueue, onEvent: @escaping (DispatchSource.FileSystemEvent) -> Void) {
+        let canonicalURL = url.standardizedFileURL.resolvingSymlinksInPath()
+        let descriptor = open(canonicalURL.path, O_EVTONLY)
+        guard descriptor >= 0 else { return nil }
+
+        self.url = canonicalURL
+        self.source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: descriptor,
+            eventMask: [.write, .rename, .delete, .attrib, .extend],
+            queue: queue
+        )
+        self.source.setEventHandler { [weak source = self.source] in
+            guard let source else { return }
+            onEvent(source.data)
+        }
+        self.source.setCancelHandler {
+            close(descriptor)
+        }
+        self.source.resume()
+    }
+
+    deinit {
+        source.cancel()
+    }
+}
 
 public struct KeyValueField: Identifiable, Hashable {
     public let id: UUID
@@ -111,6 +142,11 @@ public final class KubeConfigViewModel: ObservableObject {
     private var lastSnapshotYAML: String = ""
     private var suppressHistoryTracking = false
     private var currentSessionKey: String = "unsaved-\(UUID().uuidString)"
+    private var watchedFileURL: URL?
+    private var fileWatcherHandle: KubeconfigFileWatcherHandle?
+    private var watcherRetryTask: Task<Void, Never>?
+    private var watcherHealthTask: Task<Void, Never>?
+    private var ignoreExternalChangesUntil = Date.distantPast
 
     private struct HistorySnapshot {
         let yaml: String
@@ -165,6 +201,7 @@ public final class KubeConfigViewModel: ObservableObject {
 
     public func newEmpty() {
         suppressHistoryTracking = true
+        stopWatchingCurrentFile()
         currentSessionKey = "unsaved-\(UUID().uuidString)"
         contexts = [NamedItem(name: "new-context", fields: [
             KeyValueField(key: "cluster", value: "new-cluster"),
@@ -263,6 +300,7 @@ public final class KubeConfigViewModel: ObservableObject {
         try createDraftFile(fromYAML: workspaceYAML)
         try? syncGitWorkingTree(yaml: workspaceYAML)
         try? ensureInitialGitSnapshot(yaml: workspaceYAML, reason: "initial-load")
+        restartWatchingCurrentFile(at: url)
         resetHistory(reason: "load")
         suppressHistoryTracking = false
         hasUnsavedChanges = false
@@ -493,6 +531,7 @@ public final class KubeConfigViewModel: ObservableObject {
     }
 
     public func save(to url: URL) throws {
+        ignoreExternalChanges(seconds: 1.0)
         let oldSession = currentSessionKey
         let newSession = sessionKey(for: url)
         let projection = projectedForExport()
@@ -518,6 +557,7 @@ public final class KubeConfigViewModel: ObservableObject {
         try createDraftFile(fromYAML: workspaceYAML)
         try? syncGitWorkingTree(yaml: workspaceYAML)
         try? commitGitSnapshot(yaml: workspaceYAML, reason: "save")
+        restartWatchingCurrentFile(at: url)
         hasUnsavedChanges = false
         if let kubectlInfo {
             validationMessage = kubectlInfo
@@ -1279,7 +1319,110 @@ public final class KubeConfigViewModel: ObservableObject {
         } else {
             selection = nil
         }
+        if let sourceURL {
+            restartWatchingCurrentFile(at: sourceURL)
+        } else {
+            stopWatchingCurrentFile()
+        }
         suppressHistoryTracking = false
+    }
+
+    private func restartWatchingCurrentFile(at url: URL) {
+        stopWatchingCurrentFile()
+        let canonicalURL = url.standardizedFileURL.resolvingSymlinksInPath()
+        watchedFileURL = canonicalURL
+
+        guard let handle = KubeconfigFileWatcherHandle(
+            url: canonicalURL,
+            queue: DispatchQueue.global(qos: .utility),
+            onEvent: { [weak self] events in
+            Task { @MainActor in
+                self?.handleWatchedFileEvents(events)
+            }
+        }) else {
+            scheduleWatcherRetry(for: canonicalURL)
+            return
+        }
+
+        fileWatcherHandle = handle
+        startWatcherHealthMonitor(for: canonicalURL)
+        synchronizeCurrentContextFromDisk(at: canonicalURL)
+    }
+
+    private func stopWatchingCurrentFile() {
+        watcherRetryTask?.cancel()
+        watcherRetryTask = nil
+        watcherHealthTask?.cancel()
+        watcherHealthTask = nil
+        fileWatcherHandle = nil
+        watchedFileURL = nil
+    }
+
+    private func scheduleWatcherRetry(for url: URL) {
+        watcherRetryTask?.cancel()
+        watcherRetryTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(300))
+                guard let self else { return }
+                guard self.fileWatcherHandle == nil else { return }
+                guard self.watchedFileURL == url else { return }
+                if FileManager.default.fileExists(atPath: url.path) {
+                    self.restartWatchingCurrentFile(at: url)
+                    return
+                }
+            }
+        }
+    }
+
+    private func startWatcherHealthMonitor(for url: URL) {
+        watcherHealthTask?.cancel()
+        watcherHealthTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(300))
+                guard let self else { return }
+                guard self.watchedFileURL == url else { return }
+                if !FileManager.default.fileExists(atPath: url.path) {
+                    self.restartWatchingCurrentFile(at: url)
+                    return
+                }
+            }
+        }
+    }
+
+    private func ignoreExternalChanges(seconds: TimeInterval) {
+        ignoreExternalChangesUntil = Date().addingTimeInterval(seconds)
+    }
+
+    private func handleWatchedFileEvents(_ events: DispatchSource.FileSystemEvent) {
+        guard Date() >= ignoreExternalChangesUntil else { return }
+        guard let url = watchedFileURL else { return }
+
+        if events.contains(.delete) || events.contains(.rename) {
+            // Atomic writes can replace inode, so recreate the watcher.
+            restartWatchingCurrentFile(at: url)
+        }
+
+        synchronizeCurrentContextFromDisk(at: url)
+    }
+
+    private func synchronizeCurrentContextFromDisk(at url: URL) {
+        guard let diskContext = try? readCurrentContext(from: url) else { return }
+        guard diskContext != currentContext else { return }
+        guard diskContext.isEmpty || contexts.contains(where: { $0.name == diskContext }) else { return }
+
+        suppressHistoryTracking = true
+        currentContext = diskContext
+        suppressHistoryTracking = false
+        statusMessage = "Current context обновлен из файла: \(diskContext.isEmpty ? "<empty>" : diskContext)"
+    }
+
+    private func readCurrentContext(from url: URL) throws -> String {
+        let text = try String(contentsOf: url, encoding: .utf8)
+        let loaded = try Yams.load(yaml: text)
+        guard let root = loaded as? [String: Any] else {
+            throw NSError(domain: "KubeconfigEditor", code: 1033, userInfo: [NSLocalizedDescriptionKey: "Неверный формат kubeconfig: корень должен быть map"])
+        }
+        return root["current-context"] as? String ?? ""
     }
 
     private func workspaceFileURL(for kubeconfigURL: URL) -> URL {

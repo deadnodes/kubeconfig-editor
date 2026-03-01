@@ -169,6 +169,61 @@ struct KubeConfigViewModelTests {
         }
     }
 
+    @Test("watcher picks up external current-context switch")
+    func watcherPicksUpExternalCurrentContextSwitch() async throws {
+        let tempDir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let vm = KubeConfigViewModel()
+        let file = try writeFixture(dir: tempDir, named: "watch.yaml", content: fixtureYAML)
+        try vm.load(from: file)
+        #expect(vm.currentContext == "ctx-1")
+
+        let switched = fixtureYAML.replacingOccurrences(of: "current-context: ctx-1", with: "current-context: ctx-2")
+        try switched.write(to: file, atomically: true, encoding: .utf8)
+
+        let switchedInModel = await waitUntil(timeout: 3.0) { vm.currentContext == "ctx-2" }
+        #expect(switchedInModel)
+        #expect(vm.hasUnsavedChanges == false)
+    }
+
+    @Test("watcher ignores unknown current-context from external edits")
+    func watcherIgnoresUnknownCurrentContextFromExternalEdits() async throws {
+        let tempDir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let vm = KubeConfigViewModel()
+        let file = try writeFixture(dir: tempDir, named: "watch-unknown.yaml", content: fixtureYAML)
+        try vm.load(from: file)
+        #expect(vm.currentContext == "ctx-1")
+
+        let unknown = fixtureYAML.replacingOccurrences(of: "current-context: ctx-1", with: "current-context: ghost-context")
+        try unknown.write(to: file, atomically: true, encoding: .utf8)
+        try await Task.sleep(for: .milliseconds(600))
+
+        #expect(vm.currentContext == "ctx-1")
+    }
+
+    @Test("watcher survives file delete and recovers after recreate")
+    func watcherSurvivesFileDeleteAndRecoversAfterRecreate() async throws {
+        let tempDir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let vm = KubeConfigViewModel()
+        let file = try writeFixture(dir: tempDir, named: "watch-recreate.yaml", content: fixtureYAML)
+        try vm.load(from: file)
+        #expect(vm.currentContext == "ctx-1")
+
+        try FileManager.default.removeItem(at: file)
+        try await Task.sleep(for: .milliseconds(700))
+
+        let switched = fixtureYAML.replacingOccurrences(of: "current-context: ctx-1", with: "current-context: ctx-2")
+        try switched.write(to: file, atomically: true, encoding: .utf8)
+
+        let switchedInModel = await waitUntil(timeout: 4.0) { vm.currentContext == "ctx-2" }
+        #expect(switchedInModel)
+    }
+
     @Test("rename cluster/user everywhere updates context refs")
     func renameClusterAndUserEverywhereUpdatesReferences() throws {
         try withTempDir { tempDir in
@@ -390,12 +445,28 @@ struct KubeConfigViewModelTests {
     }
 
     private func withTempDir(_ body: (URL) throws -> Void) throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try body(dir)
+    }
+
+    private func makeTempDir() throws -> URL {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("kubeconfig-editor-tests")
             .appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
-        try body(dir)
+        return dir
+    }
+
+    private func waitUntil(timeout: TimeInterval, intervalMs: UInt64 = 50, condition: @escaping @MainActor () -> Bool) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() {
+                return true
+            }
+            try? await Task.sleep(for: .milliseconds(intervalMs))
+        }
+        return condition()
     }
 
     private func writeFixture(dir: URL, named name: String, content: String) throws -> URL {

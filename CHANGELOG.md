@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 The format follows Keep a Changelog and semantic versioning.
 
+## [0.0.12] - 2026-03-01
+
+### Fixed
+- Synced `current-context` with external kubeconfig changes (for example after manual `kubectl config use-context ...` in terminal) without reopening the file.
+- Added resilient kubeconfig file watching to handle atomic replace/write flows and keep active context state up to date.
+
 ## [0.0.11] - 2026-02-27
 
 ### Fixed
