@@ -103,7 +103,8 @@ struct AppView: View {
         .overlay(alignment: .bottomTrailing) {
             if updater.hasNewerAvailableUpdate, let update = updater.availableUpdate {
                 UpdateToast(
-                    version: update.version,
+                    availableVersion: update.version,
+                    currentVersion: updater.currentVersion,
                     isInstalling: updater.isUpdateInProgress || isStartingUpdateInstall,
                     status: updater.installStatus,
                     onUpdate: { requestUpdateInstall() },
@@ -1527,7 +1528,8 @@ struct VersionsSheet: View {
 }
 
 struct UpdateToast: View {
-    let version: String
+    let availableVersion: String
+    let currentVersion: String
     let isInstalling: Bool
     let status: String
     var onUpdate: () -> Void
@@ -1537,7 +1539,7 @@ struct UpdateToast: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("New version available")
                 .font(.headline)
-            Text("Version \(version)")
+            Text("Current: \(currentVersion)  ->  New: \(availableVersion)")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
             if !status.isEmpty {
