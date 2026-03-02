@@ -51,6 +51,15 @@ struct AppView: View {
     @State private var awsEksRegion = "eu-central-1"
     @State private var awsEksProfile = ""
     @State private var awsEksMessage = ""
+    @State private var showOIDCSetupSheet = false
+    @State private var oidcTargetUserID: UUID?
+    @State private var oidcIssuerURL = ""
+    @State private var oidcClientID = ""
+    @State private var oidcClientSecret = ""
+    @State private var oidcScopes = "profile,email"
+    @State private var oidcSetupMessage = ""
+    @State private var oidcReauthContextID: UUID?
+    @State private var isOIDCReauthInProgress = false
 
     var body: some View {
         NavigationSplitView {
@@ -304,6 +313,18 @@ struct AppView: View {
                 onClose: { showAwsEksQuickAddSheet = false }
             )
             .frame(minWidth: 880, minHeight: 620)
+        }
+        .sheet(isPresented: $showOIDCSetupSheet) {
+            OIDCSetupSheet(
+                issuerURL: $oidcIssuerURL,
+                clientID: $oidcClientID,
+                clientSecret: $oidcClientSecret,
+                scopes: $oidcScopes,
+                message: $oidcSetupMessage,
+                onApply: { applyOIDCSetup() },
+                onClose: { showOIDCSetupSheet = false }
+            )
+            .frame(minWidth: 840, minHeight: 540)
         }
     }
 
@@ -596,6 +617,9 @@ struct AppView: View {
     private var userDetail: some View {
         if let id = selectedUserId(),
            let index = viewModel.users.firstIndex(where: { $0.id == id }) {
+            let user = viewModel.users[index]
+            let oidcMode = viewModel.userOIDCAuthMode(user)
+            let linkedContexts = viewModel.contextsLinkedToUser(user.name)
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     if let warning = viewModel.userWarning(viewModel.users[index]) {
@@ -604,6 +628,73 @@ struct AppView: View {
 
                     GenericItemEditor(title: "User", item: $viewModel.users[index]) { oldName, newName in
                         viewModel.syncContextReferences(oldName: oldName, newName: newName, type: "user")
+                    }
+
+                    GroupBox("OIDC Auth") {
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack(spacing: 8) {
+                                Text("Mode:")
+                                    .foregroundStyle(.secondary)
+                                Text(oidcMode == .exec ? "Exec (kubelogin)" : (oidcMode == .legacy ? "Legacy auth-provider" : "Not configured"))
+                                    .font(.body.monospaced())
+                            }
+
+                            if oidcMode == .legacy {
+                                Text("Detected legacy `auth-provider: oidc`. Recommended: migrate to exec (`kubectl oidc-login`) for automatic token refresh.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            if !linkedContexts.isEmpty {
+                                Picker("Context", selection: Binding<UUID?>(
+                                    get: {
+                                        if let selected = oidcReauthContextID,
+                                           linkedContexts.contains(where: { $0.id == selected }) {
+                                            return selected
+                                        }
+                                        return linkedContexts.first?.id
+                                    },
+                                    set: { oidcReauthContextID = $0 }
+                                )) {
+                                    ForEach(linkedContexts) { context in
+                                        Text(context.name).tag(Optional(context.id))
+                                    }
+                                }
+                                .pickerStyle(.menu)
+                                .onAppear {
+                                    syncOIDCReauthContext(with: linkedContexts)
+                                }
+                                .onChange(of: linkedContexts.map(\.id)) { _ in
+                                    syncOIDCReauthContext(with: linkedContexts)
+                                }
+                            }
+
+                            HStack {
+                                Button("Setup OIDC Exec...") {
+                                    openOIDCSetup(for: user.id)
+                                }
+                                .buttonStyle(.bordered)
+
+                                Button("Migrate Legacy Fields") {
+                                    migrateLegacyOIDCFields(for: user.id)
+                                }
+                                .buttonStyle(.bordered)
+                                .disabled(!viewModel.userNeedsLegacyMigration(user))
+
+                                Button(isOIDCReauthInProgress ? "Re-auth in progress..." : "Re-auth Selected Context") {
+                                    if let contextID = oidcReauthContextID ?? linkedContexts.first?.id {
+                                        runOIDCReauth(contextID: contextID)
+                                    }
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .disabled(
+                                    isOIDCReauthInProgress ||
+                                    oidcMode != .exec ||
+                                    (oidcReauthContextID == nil && linkedContexts.first == nil)
+                                )
+                            }
+                        }
+                        .padding(.vertical, 4)
                     }
 
                     GroupBox("Relations") {
@@ -875,6 +966,65 @@ struct AppView: View {
         } catch {
             awsEksMessage = "Ошибка создания AWS EKS context: \(error.localizedDescription)"
         }
+    }
+
+    private func openOIDCSetup(for userID: UUID) {
+        oidcTargetUserID = userID
+        if oidcIssuerURL.isEmpty { oidcIssuerURL = "https://dex.example.com" }
+        if oidcClientID.isEmpty { oidcClientID = "kubernetes" }
+        oidcSetupMessage = ""
+        showOIDCSetupSheet = true
+    }
+
+    private func applyOIDCSetup() {
+        guard let userID = oidcTargetUserID else {
+            oidcSetupMessage = "User not selected"
+            return
+        }
+        let scopes = oidcScopes
+            .split(whereSeparator: { $0 == "," || $0 == " " || $0 == "\n" || $0 == "\t" })
+            .map(String.init)
+        do {
+            try viewModel.configureOIDCExec(
+                userID: userID,
+                issuerURL: oidcIssuerURL,
+                clientID: oidcClientID,
+                clientSecret: oidcClientSecret,
+                extraScopes: scopes
+            )
+            oidcSetupMessage = "OIDC exec configured"
+            showOIDCSetupSheet = false
+        } catch {
+            oidcSetupMessage = "OIDC setup error: \(error.localizedDescription)"
+        }
+    }
+
+    private func migrateLegacyOIDCFields(for userID: UUID) {
+        do {
+            try viewModel.migrateLegacyOIDCFields(userID: userID)
+        } catch {
+            viewModel.statusMessage = "OIDC migration error: \(error.localizedDescription)"
+        }
+    }
+
+    private func runOIDCReauth(contextID: UUID) {
+        guard !isOIDCReauthInProgress else { return }
+        isOIDCReauthInProgress = true
+        Task {
+            defer { isOIDCReauthInProgress = false }
+            do {
+                try await viewModel.triggerOIDCReauth(contextID: contextID)
+            } catch {
+                viewModel.statusMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func syncOIDCReauthContext(with contexts: [NamedItem]) {
+        if let selected = oidcReauthContextID, contexts.contains(where: { $0.id == selected }) {
+            return
+        }
+        oidcReauthContextID = contexts.first?.id
     }
 
     private func makeCurrentAndSave() {
@@ -1633,6 +1783,59 @@ struct UpdatesSheet: View {
                     .font(.caption)
             }
 
+            Spacer()
+        }
+        .padding(14)
+    }
+}
+
+struct OIDCSetupSheet: View {
+    @Binding var issuerURL: String
+    @Binding var clientID: String
+    @Binding var clientSecret: String
+    @Binding var scopes: String
+    @Binding var message: String
+
+    var onApply: () -> Void
+    var onClose: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Setup OIDC Exec")
+                    .font(.title3)
+                Spacer()
+                Button("Close") { onClose() }
+                    .buttonStyle(.borderedProminent)
+            }
+
+            Divider()
+
+            GroupBox("OIDC Provider") {
+                VStack(alignment: .leading, spacing: 10) {
+                    TextField("Issuer URL (https://dex.example.com)", text: $issuerURL)
+                    TextField("Client ID", text: $clientID)
+                    SecureField("Client secret (optional)", text: $clientSecret)
+                    TextField("Extra scopes (comma-separated, e.g. profile,email,groups)", text: $scopes)
+                }
+                .textFieldStyle(.roundedBorder)
+            }
+
+            Text("This configures selected user with `exec` plugin (`kubectl oidc-login get-token`). Legacy token/auth-provider fields are migrated separately by explicit action.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            if !message.isEmpty {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(message.lowercased().contains("error") ? .red : .secondary)
+            }
+
+            HStack {
+                Spacer()
+                Button("Apply") { onApply() }
+                    .buttonStyle(.borderedProminent)
+            }
             Spacer()
         }
         .padding(14)

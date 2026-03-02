@@ -73,6 +73,12 @@ public enum MergeEntityType: String, Hashable {
     case user
 }
 
+public enum UserOIDCAuthMode: String, Hashable {
+    case none
+    case exec
+    case legacy
+}
+
 public struct MergeFieldChange: Identifiable, Hashable {
     public let id: String
     public let entity: MergeEntityType
@@ -116,6 +122,10 @@ public extension NamedItem {
             return
         }
         fields.append(KeyValueField(key: key, value: value))
+    }
+
+    mutating func removeField(_ key: String) {
+        fields.removeAll { $0.key == key }
     }
 }
 
@@ -706,6 +716,138 @@ public final class KubeConfigViewModel: ObservableObject {
         }
         statusMessage = "AWS EKS context added: \(contextItem.name)"
         triggerBackgroundValidationIfNeeded()
+    }
+
+    public func userOIDCAuthMode(_ user: NamedItem) -> UserOIDCAuthMode {
+        if userHasOIDCExec(user) {
+            return .exec
+        }
+        if userHasLegacyOIDC(user) {
+            return .legacy
+        }
+        return .none
+    }
+
+    public func userHasOIDCExec(_ user: NamedItem) -> Bool {
+        let execRaw = user.fieldValue("exec").lowercased()
+        return execRaw.contains("oidc-login") || execRaw.contains("kubelogin")
+    }
+
+    public func configureOIDCExec(
+        userID: UUID,
+        issuerURL: String,
+        clientID: String,
+        clientSecret: String,
+        extraScopes: [String]
+    ) throws {
+        guard let index = users.firstIndex(where: { $0.id == userID }) else {
+            throw NSError(domain: "KubeconfigEditor", code: 1034, userInfo: [NSLocalizedDescriptionKey: "User не найден"])
+        }
+
+        let issuer = issuerURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let client = clientID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let secret = clientSecret.trimmingCharacters(in: .whitespacesAndNewlines)
+        let scopes = extraScopes
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        guard !issuer.isEmpty else {
+            throw NSError(domain: "KubeconfigEditor", code: 1035, userInfo: [NSLocalizedDescriptionKey: "OIDC issuer URL обязателен"])
+        }
+        guard !client.isEmpty else {
+            throw NSError(domain: "KubeconfigEditor", code: 1036, userInfo: [NSLocalizedDescriptionKey: "OIDC client ID обязателен"])
+        }
+
+        var args: [String] = [
+            "oidc-login",
+            "get-token",
+            "--oidc-issuer-url", issuer,
+            "--oidc-client-id", client
+        ]
+        if !secret.isEmpty {
+            args.append(contentsOf: ["--oidc-client-secret", secret])
+        }
+        for scope in scopes {
+            args.append(contentsOf: ["--oidc-extra-scope", scope])
+        }
+
+        let execObject: [String: Any] = [
+            "apiVersion": "client.authentication.k8s.io/v1beta1",
+            "command": "kubectl",
+            "args": args,
+            "interactiveMode": "IfAvailable",
+            "provideClusterInfo": false
+        ]
+
+        users[index].setField("exec", value: anyToString(execObject))
+        statusMessage = "OIDC exec настроен для user '\(users[index].name)'"
+        triggerBackgroundValidationIfNeeded()
+    }
+
+    public func userNeedsLegacyMigration(_ user: NamedItem) -> Bool {
+        userHasOIDCExec(user) && (userHasLegacyOIDC(user) || userHasLegacyTokenFields(user))
+    }
+
+    public func migrateLegacyOIDCFields(userID: UUID) throws {
+        guard let index = users.firstIndex(where: { $0.id == userID }) else {
+            throw NSError(domain: "KubeconfigEditor", code: 1042, userInfo: [NSLocalizedDescriptionKey: "User не найден"])
+        }
+
+        guard userHasOIDCExec(users[index]) else {
+            throw NSError(domain: "KubeconfigEditor", code: 1043, userInfo: [NSLocalizedDescriptionKey: "Сначала настрой OIDC exec"])
+        }
+
+        users[index].removeField("auth-provider")
+        users[index].removeField("token")
+        users[index].removeField("id-token")
+        users[index].removeField("refresh-token")
+        users[index].removeField("username")
+        users[index].removeField("password")
+        statusMessage = "Legacy OIDC fields migrated for user '\(users[index].name)'"
+        triggerBackgroundValidationIfNeeded()
+    }
+
+    public func buildOIDCReauthCommand(contextID: UUID) throws -> [String] {
+        guard let context = contexts.first(where: { $0.id == contextID }) else {
+            throw NSError(domain: "KubeconfigEditor", code: 1037, userInfo: [NSLocalizedDescriptionKey: "Context не найден"])
+        }
+        let userName = context.fieldValue("user").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !userName.isEmpty else {
+            throw NSError(domain: "KubeconfigEditor", code: 1038, userInfo: [NSLocalizedDescriptionKey: "У context нет user"])
+        }
+        guard let user = users.first(where: { $0.name == userName }) else {
+            throw NSError(domain: "KubeconfigEditor", code: 1039, userInfo: [NSLocalizedDescriptionKey: "User '\(userName)' не найден"])
+        }
+        guard userHasOIDCExec(user) else {
+            throw NSError(domain: "KubeconfigEditor", code: 1040, userInfo: [NSLocalizedDescriptionKey: "User '\(userName)' не настроен на OIDC exec"])
+        }
+
+        let kubeconfigPath = (currentPath ?? defaultKubeconfigURL).path
+        return [
+            "kubectl",
+            "--kubeconfig", kubeconfigPath,
+            "--context", context.name,
+            "get",
+            "--raw=/version"
+        ]
+    }
+
+    public func triggerOIDCReauth(contextID: UUID) async throws {
+        let command = try buildOIDCReauthCommand(contextID: contextID)
+        let result = await Task.detached(priority: .userInitiated) {
+            Self.runExternalCommand(arguments: command)
+        }.value
+
+        if result.exitCode != 0 {
+            let details = result.stderr.isEmpty ? "kubectl exited with code \(result.exitCode)" : result.stderr
+            throw NSError(domain: "KubeconfigEditor", code: 1041, userInfo: [NSLocalizedDescriptionKey: "OIDC re-auth failed: \(details)"])
+        }
+
+        if let context = contexts.first(where: { $0.id == contextID }) {
+            statusMessage = "OIDC re-auth completed for context '\(context.name)'"
+        } else {
+            statusMessage = "OIDC re-auth completed"
+        }
     }
 
     public func deleteSelected() {
@@ -1917,6 +2059,52 @@ public final class KubeConfigViewModel: ObservableObject {
         "insecure-skip-tls-verify",
         "disable-compression"
     ]
+
+    private func userHasLegacyOIDC(_ user: NamedItem) -> Bool {
+        let legacyRaw = user.fieldValue("auth-provider").lowercased()
+        return legacyRaw.contains("oidc")
+    }
+
+    private func userHasLegacyTokenFields(_ user: NamedItem) -> Bool {
+        !user.fieldValue("token").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+        !user.fieldValue("id-token").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+        !user.fieldValue("refresh-token").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private struct ExternalCommandResult: Sendable {
+        let exitCode: Int32
+        let stdout: String
+        let stderr: String
+    }
+
+    private nonisolated static func runExternalCommand(arguments: [String]) -> ExternalCommandResult {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = arguments
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return ExternalCommandResult(
+                exitCode: -1,
+                stdout: "",
+                stderr: "cannot start process: \(error.localizedDescription)"
+            )
+        }
+
+        let outData = stdout.fileHandleForReading.readDataToEndOfFile()
+        let errData = stderr.fileHandleForReading.readDataToEndOfFile()
+        let outText = String(data: outData, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let errText = String(data: errData, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return ExternalCommandResult(exitCode: process.terminationStatus, stdout: outText, stderr: errText)
+    }
 
     private func uniqueName(base: String, in items: [NamedItem]) -> String {
         var index = 1

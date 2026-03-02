@@ -436,6 +436,99 @@ struct KubeConfigViewModelTests {
         #expect(createdCluster.fieldValue("certificate-authority-data") == "LS0tTEST==")
     }
 
+    @Test("configure OIDC exec keeps legacy auth fields until explicit migration")
+    func configureOIDCExecKeepsLegacyAuthFieldsUntilExplicitMigration() throws {
+        try withTempDir { tempDir in
+            let vm = KubeConfigViewModel()
+            try vm.load(from: writeFixture(dir: tempDir, named: "oidc.yaml", content: fixtureYAML))
+
+            let initialUser = try #require(vm.users.first(where: { $0.name == "user-a" }))
+            let userID = initialUser.id
+            if let idx = vm.users.firstIndex(where: { $0.id == userID }) {
+                vm.users[idx].setField("auth-provider", value: "{name: oidc}")
+                vm.users[idx].setField("token", value: "legacy-token")
+            }
+
+            try vm.configureOIDCExec(
+                userID: userID,
+                issuerURL: "https://dex.example.com",
+                clientID: "kubernetes",
+                clientSecret: "secret-x",
+                extraScopes: ["profile", "email", "groups"]
+            )
+
+            let user = try #require(vm.users.first(where: { $0.id == userID }))
+            #expect(vm.userOIDCAuthMode(user) == .exec)
+            #expect(vm.userHasOIDCExec(user))
+            #expect(user.fieldValue("exec").contains("oidc-login"))
+            #expect(!user.fieldValue("auth-provider").isEmpty)
+            #expect(!user.fieldValue("token").isEmpty)
+            #expect(vm.userNeedsLegacyMigration(user))
+        }
+    }
+
+    @Test("explicit legacy OIDC migration clears old auth fields")
+    func explicitLegacyOIDCMigrationClearsOldAuthFields() throws {
+        try withTempDir { tempDir in
+            let vm = KubeConfigViewModel()
+            try vm.load(from: writeFixture(dir: tempDir, named: "oidc-migration.yaml", content: fixtureYAML))
+
+            let initialUser = try #require(vm.users.first(where: { $0.name == "user-a" }))
+            let userID = initialUser.id
+            if let idx = vm.users.firstIndex(where: { $0.id == userID }) {
+                vm.users[idx].setField("auth-provider", value: "{name: oidc}")
+                vm.users[idx].setField("token", value: "legacy-token")
+                vm.users[idx].setField("id-token", value: "id-token-x")
+                vm.users[idx].setField("refresh-token", value: "refresh-token-x")
+            }
+
+            try vm.configureOIDCExec(
+                userID: userID,
+                issuerURL: "https://dex.example.com",
+                clientID: "kubernetes",
+                clientSecret: "",
+                extraScopes: []
+            )
+
+            try vm.migrateLegacyOIDCFields(userID: userID)
+
+            let user = try #require(vm.users.first(where: { $0.id == userID }))
+            #expect(user.fieldValue("auth-provider").isEmpty)
+            #expect(user.fieldValue("token").isEmpty)
+            #expect(user.fieldValue("id-token").isEmpty)
+            #expect(user.fieldValue("refresh-token").isEmpty)
+            #expect(!vm.userNeedsLegacyMigration(user))
+        }
+    }
+
+    @Test("build OIDC reauth command targets selected context and kubeconfig")
+    func buildOIDCReauthCommandTargetsContextAndKubeconfig() throws {
+        try withTempDir { tempDir in
+            let vm = KubeConfigViewModel()
+            let file = try writeFixture(dir: tempDir, named: "oidc-cmd.yaml", content: fixtureYAML)
+            try vm.load(from: file)
+
+            let userID = try #require(vm.users.first(where: { $0.name == "user-a" })?.id)
+            try vm.configureOIDCExec(
+                userID: userID,
+                issuerURL: "https://dex.example.com",
+                clientID: "kubernetes",
+                clientSecret: "",
+                extraScopes: []
+            )
+
+            let contextID = try #require(vm.contexts.first(where: { $0.name == "ctx-1" })?.id)
+            let cmd = try vm.buildOIDCReauthCommand(contextID: contextID)
+
+            #expect(cmd.first == "kubectl")
+            #expect(cmd.contains("--context"))
+            #expect(cmd.contains("ctx-1"))
+            #expect(cmd.contains("--kubeconfig"))
+            #expect(cmd.contains(file.path))
+            #expect(cmd.suffix(2) == ["get", "--raw=/version"])
+        }
+    }
+
     @Test("version compare handles semantic parts")
     func versionComparisonHandlesSemanticParts() {
         #expect(isVersion("1.2.4", newerThan: "1.2.3"))

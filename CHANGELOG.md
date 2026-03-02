@@ -4,6 +4,21 @@ All notable changes to this project are documented in this file.
 
 The format follows Keep a Changelog and semantic versioning.
 
+## [0.0.13] - 2026-03-02
+
+### Added
+- Added OIDC support flow in `Users`: `Setup OIDC Exec` wizard (issuer URL, client ID/secret, scopes) to configure `exec` auth via `kubectl oidc-login`.
+- Added context-scoped `Re-auth Selected Context` action for OIDC `exec` users.
+- Added OIDC auth mode detection (`exec` / legacy `auth-provider` / not configured) with UI hints for migration.
+
+### Changed
+- Update toast now displays both current and new app versions (`Current -> New`) in the bottom popup.
+- OIDC legacy field migration is now explicit/manual (button-triggered), not automatic during `Setup OIDC Exec`.
+
+### Fixed
+- Hardened kubeconfig file watcher lifecycle and recovery when kubeconfig file is deleted/recreated.
+- Added watcher behavior tests for external context switch, invalid external context, and delete/recreate recovery.
+
 ## [0.0.12] - 2026-03-01
 
 ### Fixed
