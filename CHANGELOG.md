@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file.
 
 The format follows Keep a Changelog and semantic versioning.
 
+## [0.0.16] - 2026-03-04
+
+### Added
+- Added editable `Duration` input next to `Reissue Token` in both `Contexts` and `Users` ServiceAccount token panels.
+
+### Changed
+- `Reissue Token` now uses explicit user-provided duration when set.
+- Default reissue duration is now auto-filled from the currently selected token lifetime (`exp - iat`) to simplify like-for-like token renewal.
+
+### Fixed
+- Added test coverage to verify explicit duration is passed to `kubectl create token --duration=...`.
+
 ## [0.0.15] - 2026-03-04
 
 ### Added

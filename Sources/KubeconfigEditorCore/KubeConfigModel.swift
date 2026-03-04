@@ -999,7 +999,8 @@ public final class KubeConfigViewModel: ObservableObject {
 
     public func reissueServiceAccountToken(
         userID: UUID,
-        contextID: UUID?
+        contextID: UUID?,
+        duration: String? = nil
     ) async throws -> ServiceAccountTokenInfo {
         guard let userIndex = users.firstIndex(where: { $0.id == userID }) else {
             throw NSError(domain: "KubeconfigEditor", code: 1061, userInfo: [NSLocalizedDescriptionKey: "User not found"])
@@ -1021,7 +1022,10 @@ public final class KubeConfigViewModel: ObservableObject {
             throw NSError(domain: "KubeconfigEditor", code: 1063, userInfo: [NSLocalizedDescriptionKey: "No context linked to selected user"])
         }
 
-        let duration: String = {
+        let resolvedDuration: String = {
+            if let duration, !duration.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return duration.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
             guard let issuedAt = tokenInfo.issuedAt else { return "8760h" }
             let seconds = Int(tokenInfo.expiresAt.timeIntervalSince(issuedAt))
             guard seconds > 0 else { return "8760h" }
@@ -1038,7 +1042,7 @@ public final class KubeConfigViewModel: ObservableObject {
             tokenInfo.serviceAccountName,
             "-n",
             tokenInfo.namespace,
-            "--duration=\(duration)"
+            "--duration=\(resolvedDuration)"
         ]
 
         let runner = externalCommandRunner

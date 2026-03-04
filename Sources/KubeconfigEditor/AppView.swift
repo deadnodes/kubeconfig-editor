@@ -69,6 +69,8 @@ struct AppView: View {
     @State private var isOIDCReauthInProgress = false
     @State private var saTokenReissueContextID: UUID?
     @State private var isSaTokenReissueInProgress = false
+    @State private var saTokenReissueDuration = ""
+    @State private var saTokenReissueDurationSeed = ""
     @State private var showServiceAccountKubeconfigSheet = false
     @State private var serviceAccountName = ""
     @State private var serviceAccountNamespace = "kube-system"
@@ -662,13 +664,25 @@ struct AppView: View {
                                     Text("(\(tokenTTLText(until: contextSATokenInfo.expiresAt)))")
                                         .foregroundStyle(contextSATokenInfo.expiresAt > Date() ? Color.secondary : Color.red)
                                 }
-                                Button(isSaTokenReissueInProgress ? "Reissuing token..." : "Reissue Token") {
-                                    reissueServiceAccountToken(userID: contextUser.id, contextID: context.id)
+                                HStack(spacing: 8) {
+                                    TextField("Duration (e.g. 24h, 3600s)", text: $saTokenReissueDuration)
+                                        .textFieldStyle(.roundedBorder)
+                                        .frame(maxWidth: 220)
+                                    Button(isSaTokenReissueInProgress ? "Reissuing token..." : "Reissue Token") {
+                                        reissueServiceAccountToken(
+                                            userID: contextUser.id,
+                                            contextID: context.id,
+                                            duration: saTokenReissueDuration
+                                        )
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                    .disabled(isSaTokenReissueInProgress)
                                 }
-                                .buttonStyle(.borderedProminent)
-                                .disabled(isSaTokenReissueInProgress)
                             }
                             .padding(.vertical, 4)
+                            .onAppear {
+                                updateSaTokenReissueDurationDefault(with: contextSATokenInfo)
+                            }
                         }
                     }
 
@@ -859,16 +873,25 @@ struct AppView: View {
                                     }
                                 }
 
-                                Button(isSaTokenReissueInProgress ? "Reissuing token..." : "Reissue Token") {
-                                    if let contextID = saTokenReissueContextID ?? linkedContexts.first?.id {
-                                        reissueServiceAccountToken(userID: user.id, contextID: contextID)
+                                HStack(spacing: 8) {
+                                    TextField("Duration (e.g. 24h, 3600s)", text: $saTokenReissueDuration)
+                                        .textFieldStyle(.roundedBorder)
+                                        .frame(maxWidth: 220)
+                                    Button(isSaTokenReissueInProgress ? "Reissuing token..." : "Reissue Token") {
+                                        if let contextID = saTokenReissueContextID ?? linkedContexts.first?.id {
+                                            reissueServiceAccountToken(
+                                                userID: user.id,
+                                                contextID: contextID,
+                                                duration: saTokenReissueDuration
+                                            )
+                                        }
                                     }
+                                    .buttonStyle(.borderedProminent)
+                                    .disabled(
+                                        isSaTokenReissueInProgress ||
+                                        (saTokenReissueContextID == nil && linkedContexts.first == nil)
+                                    )
                                 }
-                                .buttonStyle(.borderedProminent)
-                                .disabled(
-                                    isSaTokenReissueInProgress ||
-                                    (saTokenReissueContextID == nil && linkedContexts.first == nil)
-                                )
                             } else {
                                 Text("No renewable ServiceAccount JWT token found in this user token field.")
                                     .font(.caption)
@@ -876,6 +899,11 @@ struct AppView: View {
                             }
                         }
                         .padding(.vertical, 4)
+                        .onAppear {
+                            if let saTokenInfo {
+                                updateSaTokenReissueDurationDefault(with: saTokenInfo)
+                            }
+                        }
                     }
 
                     GroupBox("Relations") {
@@ -1593,18 +1621,44 @@ struct AppView: View {
         return "\(remaining)s"
     }
 
-    private func reissueServiceAccountToken(userID: UUID, contextID: UUID) {
+    private func reissueServiceAccountToken(userID: UUID, contextID: UUID, duration: String) {
         guard !isSaTokenReissueInProgress else { return }
         isSaTokenReissueInProgress = true
         Task {
             defer { isSaTokenReissueInProgress = false }
             do {
-                let info = try await viewModel.reissueServiceAccountToken(userID: userID, contextID: contextID)
+                let info = try await viewModel.reissueServiceAccountToken(
+                    userID: userID,
+                    contextID: contextID,
+                    duration: duration
+                )
+                updateSaTokenReissueDurationDefault(with: info)
                 viewModel.statusMessage = "Token reissued. Expires at \(info.expiresAt.formatted(date: .abbreviated, time: .standard))"
             } catch {
                 viewModel.statusMessage = "Token reissue error: \(error.localizedDescription)"
             }
         }
+    }
+
+    private func updateSaTokenReissueDurationDefault(with info: ServiceAccountTokenInfo) {
+        let seed = "\(info.namespace)|\(info.serviceAccountName)|\(Int(info.expiresAt.timeIntervalSince1970))|\(Int(info.issuedAt?.timeIntervalSince1970 ?? 0))"
+        guard saTokenReissueDurationSeed != seed else { return }
+        saTokenReissueDuration = defaultDurationString(for: info)
+        saTokenReissueDurationSeed = seed
+    }
+
+    private func defaultDurationString(for info: ServiceAccountTokenInfo) -> String {
+        let seconds: Int
+        if let issuedAt = info.issuedAt {
+            seconds = Int(info.expiresAt.timeIntervalSince(issuedAt))
+        } else {
+            seconds = Int(info.expiresAt.timeIntervalSinceNow)
+        }
+        guard seconds > 0 else { return "1h" }
+        if seconds % 3600 == 0 {
+            return "\(seconds / 3600)h"
+        }
+        return "\(seconds)s"
     }
 
     private func makeCurrentAndSave() {

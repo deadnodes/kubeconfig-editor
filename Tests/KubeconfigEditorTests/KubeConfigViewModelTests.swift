@@ -720,6 +720,40 @@ struct KubeConfigViewModelTests {
         #expect(updatedUser.fieldValue("token") == newToken)
     }
 
+    @Test("reissue serviceaccount token uses explicit duration when provided")
+    func reissueServiceAccountTokenUsesExplicitDurationWhenProvided() async throws {
+        let capture = CommandCapture()
+        let tempDir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let issuedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        let expiresAt = issuedAt.addingTimeInterval(7200)
+        let token = makeServiceAccountJWT(namespace: "kube-system", serviceAccountName: "azuredevops", issuedAt: issuedAt, expiresAt: expiresAt)
+
+        let vm = KubeConfigViewModel(externalCommandRunner: { args in
+            capture.append(args)
+            return (exitCode: 0, stdout: token, stderr: "")
+        })
+
+        let file = try writeFixture(dir: tempDir, named: "sa-reissue-explicit.yaml", content: fixtureYAML)
+        try vm.load(from: file)
+
+        let userID = try #require(vm.users.first(where: { $0.name == "user-a" })?.id)
+        let contextID = try #require(vm.contexts.first(where: { $0.name == "ctx-1" })?.id)
+        if let idx = vm.users.firstIndex(where: { $0.id == userID }) {
+            vm.users[idx].setField("token", value: token)
+        }
+
+        _ = try await vm.reissueServiceAccountToken(
+            userID: userID,
+            contextID: contextID,
+            duration: "24h"
+        )
+
+        let args = try #require(capture.last())
+        #expect(args.contains("--duration=24h"))
+    }
+
     @Test("dependency status checks command availability")
     func dependencyStatusChecksCommandAvailability() async {
         let vm = KubeConfigViewModel(externalCommandRunner: { args in
