@@ -74,6 +74,68 @@ struct KubeConfigViewModelTests {
         }
     }
 
+    @Test("merge into project reuses equivalent cluster and user instead of duplicating")
+    func mergeImportTextIntoProjectReusesEquivalentClusterAndUser() throws {
+        try withTempDir { tempDir in
+            let vm = KubeConfigViewModel()
+            try vm.load(from: writeFixture(dir: tempDir, named: "base.yaml", content: fixtureYAML))
+
+            let importYAML = """
+            apiVersion: v1
+            kind: Config
+            current-context: ctx-sa
+            clusters:
+              - name: cluster-a-copy
+                cluster:
+                  server: https://127.0.0.1:6443
+            users:
+              - name: user-a-copy
+                user:
+                  token: token-a
+            contexts:
+              - name: ctx-sa
+                context:
+                  cluster: cluster-a-copy
+                  user: user-a-copy
+                  namespace: kube-system
+            """
+
+            let initialClusterCount = vm.clusters.count
+            let initialUserCount = vm.users.count
+            let initialContextCount = vm.contexts.count
+
+            try vm.mergeImportTextIntoProject(importYAML)
+
+            #expect(vm.clusters.count == initialClusterCount)
+            #expect(vm.users.count == initialUserCount)
+            #expect(vm.contexts.count == initialContextCount + 1)
+
+            let imported = try #require(vm.contexts.first(where: { $0.name == "ctx-sa" }))
+            #expect(imported.fieldValue("cluster") == "cluster-a")
+            #expect(imported.fieldValue("user") == "user-a")
+            #expect(imported.fieldValue("namespace") == "kube-system")
+        }
+    }
+
+    @Test("unsaved changes resets when content returns to persisted baseline")
+    func unsavedChangesResetsWhenContentReturnsToPersistedBaseline() throws {
+        try withTempDir { tempDir in
+            let vm = KubeConfigViewModel()
+            let file = try writeFixture(dir: tempDir, named: "dirty.yaml", content: fixtureYAML)
+            try vm.load(from: file)
+
+            vm.addContext()
+            vm.registerEdit(reason: "add-context")
+            #expect(vm.hasUnsavedChanges)
+
+            let addedContextID = try #require(vm.selectionContextID())
+            try vm.deleteContext(addedContextID, cascade: false)
+            vm.registerEdit(reason: "delete-context")
+
+            #expect(!vm.hasUnsavedChanges)
+        }
+    }
+
     @Test("add and delete selected works for each entity type")
     func addAndDeleteSelectedByType() throws {
         try withTempDir { tempDir in
@@ -593,6 +655,167 @@ struct KubeConfigViewModelTests {
         }
     }
 
+    @Test("serviceaccount token info is parsed only for renewable jwt token")
+    func serviceAccountTokenInfoParsesOnlyRenewableJwtToken() {
+        let vm = KubeConfigViewModel()
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let token = makeServiceAccountJWT(namespace: "kube-system", serviceAccountName: "azuredevops", issuedAt: now, expiresAt: now.addingTimeInterval(3600))
+        let user = NamedItem(name: "u", fields: [KeyValueField(key: "token", value: token)])
+
+        let info = vm.serviceAccountTokenInfo(for: user)
+        #expect(info?.namespace == "kube-system")
+        #expect(info?.serviceAccountName == "azuredevops")
+        #expect(info?.issuedAt == now)
+        #expect(info?.expiresAt == now.addingTimeInterval(3600))
+
+        let invalid = NamedItem(name: "x", fields: [KeyValueField(key: "token", value: "plain-token")])
+        #expect(vm.serviceAccountTokenInfo(for: invalid) == nil)
+    }
+
+    @Test("reissue serviceaccount token updates user token and preserves ttl")
+    func reissueServiceAccountTokenUpdatesUserTokenAndPreservesTTL() async throws {
+        let capture = CommandCapture()
+        let tempDir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let oldIssuedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        let oldExpiresAt = oldIssuedAt.addingTimeInterval(3600)
+        let oldToken = makeServiceAccountJWT(namespace: "kube-system", serviceAccountName: "azuredevops", issuedAt: oldIssuedAt, expiresAt: oldExpiresAt)
+
+        let newIssuedAt = Date(timeIntervalSince1970: 1_700_010_000)
+        let newExpiresAt = newIssuedAt.addingTimeInterval(3600)
+        let newToken = makeServiceAccountJWT(namespace: "kube-system", serviceAccountName: "azuredevops", issuedAt: newIssuedAt, expiresAt: newExpiresAt)
+
+        let vm = KubeConfigViewModel(externalCommandRunner: { args in
+            capture.append(args)
+            return (exitCode: 0, stdout: newToken, stderr: "")
+        })
+
+        let file = try writeFixture(dir: tempDir, named: "sa-reissue.yaml", content: fixtureYAML)
+        try vm.load(from: file)
+
+        let userID = try #require(vm.users.first(where: { $0.name == "user-a" })?.id)
+        let contextID = try #require(vm.contexts.first(where: { $0.name == "ctx-1" })?.id)
+        if let idx = vm.users.firstIndex(where: { $0.id == userID }) {
+            vm.users[idx].setField("token", value: oldToken)
+        }
+
+        let info = try await vm.reissueServiceAccountToken(userID: userID, contextID: contextID)
+        #expect(info.namespace == "kube-system")
+        #expect(info.serviceAccountName == "azuredevops")
+        #expect(info.expiresAt == newExpiresAt)
+
+        let args = try #require(capture.last())
+        #expect(args.first == "kubectl")
+        #expect(args.contains("--context"))
+        #expect(args.contains("ctx-1"))
+        #expect(args.contains("create"))
+        #expect(args.contains("token"))
+        #expect(args.contains("azuredevops"))
+        #expect(args.contains("-n"))
+        #expect(args.contains("kube-system"))
+        #expect(args.contains("--duration=3600s"))
+
+        let updatedUser = try #require(vm.users.first(where: { $0.id == userID }))
+        #expect(updatedUser.fieldValue("token") == newToken)
+    }
+
+    @Test("dependency status checks command availability")
+    func dependencyStatusChecksCommandAvailability() async {
+        let vm = KubeConfigViewModel(externalCommandRunner: { args in
+            if args.count >= 3, args[0] == "bash", args[1] == "-lc" {
+                let script = args[2]
+                if script.contains("command -v kubectl-view-serviceaccount-kubeconfig") { return (1, "", "") }
+                if script.contains("command -v kubectl-oidc_login") { return (0, "/Users/test/.krew/bin/kubectl-oidc_login", "") }
+                if script.contains("command -v kubectl-krew") { return (1, "", "") }
+                if script.contains("command -v brew") { return (0, "/opt/homebrew/bin/brew", "") }
+                if script.contains("command -v kubectl") { return (0, "/opt/homebrew/bin/kubectl", "") }
+            }
+            return (1, "", "unexpected")
+        })
+
+        let status = await vm.checkDependencyStatus()
+        #expect(status.hasBrew)
+        #expect(status.hasKubectl)
+        #expect(!status.hasKrew)
+        #expect(status.hasOIDCPlugin)
+        #expect(!status.hasViewServiceAccountPlugin)
+    }
+
+    @Test("install kubectl dependency calls brew install")
+    func installKubectlDependencyCallsBrewInstall() async throws {
+        let capture = CommandCapture()
+        let vm = KubeConfigViewModel(externalCommandRunner: { args in
+            capture.append(args)
+            if args.count >= 3, args[0] == "bash", args[1] == "-lc" {
+                let script = args[2]
+                if script.contains("command -v brew") { return (0, "/opt/homebrew/bin/brew", "") }
+                if script == "brew install kubernetes-cli" { return (0, "installed", "") }
+            }
+            return (1, "", "unexpected")
+        })
+
+        try await vm.installKubectlDependency()
+        let commands = capture.all()
+        #expect(commands.contains(where: { $0.count >= 3 && $0[2] == "brew install kubernetes-cli" }))
+    }
+
+    @Test("project connection test uses selected context from in-memory project")
+    func testConnectionWithCurrentProjectUsesSelectedContextFromInMemoryProject() async throws {
+        let capture = CommandCapture()
+        let tempDir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let vm = KubeConfigViewModel(externalCommandRunner: { args in
+            capture.append(args)
+            capture.captureKubeconfigSnapshot(from: args)
+            return (exitCode: 0, stdout: "{\"gitVersion\":\"v1.31.0\"}", stderr: "")
+        })
+
+        let file = try writeFixture(dir: tempDir, named: "project-conn.yaml", content: fixtureYAML)
+        try vm.load(from: file)
+
+        let contextID = try #require(vm.contexts.first(where: { $0.name == "ctx-2" })?.id)
+        if let idx = vm.contexts.firstIndex(where: { $0.id == contextID }) {
+            vm.contexts[idx].name = "ctx-2-live"
+        }
+
+        let output = try await vm.testConnectionWithCurrentProject(contextID: contextID)
+        #expect(output.contains("gitVersion"))
+
+        let args = try #require(capture.last())
+        #expect(args.first == "kubectl")
+        #expect(args.contains("--kubeconfig"))
+        #expect(args.contains("--context"))
+        #expect(args.contains("ctx-2-live"))
+        #expect(args.suffix(2) == ["get", "--raw=/version"])
+
+        let snapshot = try #require(capture.lastKubeconfigSnapshot())
+        #expect(snapshot.contains("name: ctx-2-live"))
+    }
+
+    @Test("generated kubeconfig connection test uses context from provided kubeconfig")
+    func testConnectionWithGeneratedKubeconfigUsesProvidedContext() async throws {
+        let capture = CommandCapture()
+        let vm = KubeConfigViewModel(externalCommandRunner: { args in
+            capture.append(args)
+            capture.captureKubeconfigSnapshot(from: args)
+            return (exitCode: 0, stdout: "{\"major\":\"1\"}", stderr: "")
+        })
+
+        let output = try await vm.testConnectionWithKubeconfigText(fixtureYAML)
+        #expect(output.contains("major"))
+
+        let args = try #require(capture.last())
+        #expect(args.first == "kubectl")
+        #expect(args.contains("--context"))
+        #expect(args.contains("ctx-1"))
+
+        let snapshot = try #require(capture.lastKubeconfigSnapshot())
+        #expect(snapshot.contains("current-context: ctx-1"))
+        #expect(snapshot.contains("name: ctx-1"))
+    }
+
     @Test("version compare handles semantic parts")
     func versionComparisonHandlesSemanticParts() {
         #expect(isVersion("1.2.4", newerThan: "1.2.3"))
@@ -743,9 +966,46 @@ private func isVersion(_ lhs: String, newerThan rhs: String) -> Bool {
     return false
 }
 
+private extension KubeConfigViewModel {
+    func selectionContextID() -> UUID? {
+        if case .context(let id) = selection {
+            return id
+        }
+        return nil
+    }
+}
+
+private func makeServiceAccountJWT(namespace: String, serviceAccountName: String, issuedAt: Date, expiresAt: Date) -> String {
+    let header: [String: Any] = ["alg": "RS256", "typ": "JWT"]
+    let payload: [String: Any] = [
+        "iat": Int(issuedAt.timeIntervalSince1970),
+        "exp": Int(expiresAt.timeIntervalSince1970),
+        "kubernetes.io": [
+            "namespace": namespace,
+            "serviceaccount": [
+                "name": serviceAccountName
+            ]
+        ]
+    ]
+
+    let headerData = try! JSONSerialization.data(withJSONObject: header)
+    let payloadData = try! JSONSerialization.data(withJSONObject: payload)
+    let headerEncoded = base64URLEncode(headerData)
+    let payloadEncoded = base64URLEncode(payloadData)
+    return "\(headerEncoded).\(payloadEncoded).signature"
+}
+
+private func base64URLEncode(_ data: Data) -> String {
+    data.base64EncodedString()
+        .replacingOccurrences(of: "+", with: "-")
+        .replacingOccurrences(of: "/", with: "_")
+        .replacingOccurrences(of: "=", with: "")
+}
+
 private final class CommandCapture: @unchecked Sendable {
     private let lock = NSLock()
     private var commands: [[String]] = []
+    private var kubeconfigSnapshots: [String] = []
 
     func append(_ command: [String]) {
         lock.lock()
@@ -757,5 +1017,26 @@ private final class CommandCapture: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return commands.last
+    }
+
+    func all() -> [[String]] {
+        lock.lock()
+        defer { lock.unlock() }
+        return commands
+    }
+
+    func captureKubeconfigSnapshot(from command: [String]) {
+        guard let idx = command.firstIndex(of: "--kubeconfig"), idx + 1 < command.count else { return }
+        let path = command[idx + 1]
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return }
+        lock.lock()
+        kubeconfigSnapshots.append(text)
+        lock.unlock()
+    }
+
+    func lastKubeconfigSnapshot() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return kubeconfigSnapshots.last
     }
 }

@@ -10,6 +10,10 @@ enum AppMenuCommand {
     static let export = Notification.Name("AppMenuCommand.export")
     static let `import` = Notification.Name("AppMenuCommand.import")
     static let updates = Notification.Name("AppMenuCommand.updates")
+    static let checkDependencies = Notification.Name("AppMenuCommand.checkDependencies")
+    static let installKubectl = Notification.Name("AppMenuCommand.installKubectl")
+    static let installPlugins = Notification.Name("AppMenuCommand.installPlugins")
+    static let installAllDependencies = Notification.Name("AppMenuCommand.installAllDependencies")
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -95,6 +99,22 @@ struct FileMenuCommands: Commands {
             Divider()
 
             Toggle("Auto Validate YAML", isOn: $autoValidateYAML)
+        }
+
+        CommandMenu("Tools") {
+            Button("Check Dependencies") {
+                NotificationCenter.default.post(name: AppMenuCommand.checkDependencies, object: nil)
+            }
+            Button("Install kubectl") {
+                NotificationCenter.default.post(name: AppMenuCommand.installKubectl, object: nil)
+            }
+            Button("Install plugins") {
+                NotificationCenter.default.post(name: AppMenuCommand.installPlugins, object: nil)
+            }
+            Divider()
+            Button("Install all required") {
+                NotificationCenter.default.post(name: AppMenuCommand.installAllDependencies, object: nil)
+            }
         }
     }
 }

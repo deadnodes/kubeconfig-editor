@@ -4,6 +4,22 @@ All notable changes to this project are documented in this file.
 
 The format follows Keep a Changelog and semantic versioning.
 
+## [0.0.15] - 2026-03-04
+
+### Added
+- Added `Tools` menu with dependency actions: `Check Dependencies`, `Install kubectl`, `Install plugins`, and `Install all required`.
+- Added built-in dependency detection for `brew`, `kubectl`, `krew`, `kubectl-oidc_login`, and `kubectl-view-serviceaccount-kubeconfig`.
+- Added `ServiceAccount Token` panel in `Users` with JWT-based metadata display (namespace/serviceaccount, expiration, TTL) and dedicated `Reissue Token` action.
+
+### Changed
+- `Add to Project` for generated ServiceAccount kubeconfig now uses project-aware merge logic and reuses equivalent `cluster`/`user` entries instead of duplicating them.
+- ServiceAccount token reissue now preserves original token TTL (derived from `iat`/`exp`) when possible.
+
+### Fixed
+- Fixed unsaved state tracking: returning config content to persisted baseline (for example add+delete back) now correctly resets `Unsaved changes` to `Saved`.
+- Improved ServiceAccount generation workflow stability across context switches and modal reopen cycles.
+- Added and updated tests for project merge deduplication, ServiceAccount token parsing/reissue, dependency checks/install command flow, and unsaved state baseline behavior.
+
 ## [0.0.14] - 2026-03-04
 
 ### Added

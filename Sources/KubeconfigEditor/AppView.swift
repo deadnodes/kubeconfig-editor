@@ -8,6 +8,13 @@ enum WorkspaceSection: String, CaseIterable {
     case users = "Users"
 }
 
+enum ConnectionTestState {
+    case idle
+    case testing
+    case ok
+    case failed
+}
+
 struct AppView: View {
     @StateObject private var viewModel = KubeConfigViewModel()
     @StateObject private var updater = ReleaseUpdater()
@@ -60,6 +67,8 @@ struct AppView: View {
     @State private var oidcSetupMessage = ""
     @State private var oidcReauthContextID: UUID?
     @State private var isOIDCReauthInProgress = false
+    @State private var saTokenReissueContextID: UUID?
+    @State private var isSaTokenReissueInProgress = false
     @State private var showServiceAccountKubeconfigSheet = false
     @State private var serviceAccountName = ""
     @State private var serviceAccountNamespace = "kube-system"
@@ -71,6 +80,12 @@ struct AppView: View {
     @State private var availableServiceAccounts: [String] = []
     @State private var isLoadingServiceAccountNamespaces = false
     @State private var isLoadingServiceAccounts = false
+    @State private var serviceAccountLookupToken = UUID()
+    @State private var projectConnectionTestState: ConnectionTestState = .idle
+    @State private var generatedConnectionTestState: ConnectionTestState = .idle
+    @State private var projectConnectionTestToken = UUID()
+    @State private var generatedConnectionTestToken = UUID()
+    @State private var isDependencyActionInProgress = false
 
     var body: some View {
         NavigationSplitView {
@@ -153,6 +168,7 @@ struct AppView: View {
             selectedClusterIDs = []
             selectedUserIDs = []
             syncEnumSelection()
+            resetProjectConnectionTestState()
         }
         .onReceive(NotificationCenter.default.publisher(for: AppMenuCommand.open)) { _ in
             openFile()
@@ -175,6 +191,18 @@ struct AppView: View {
         .onReceive(NotificationCenter.default.publisher(for: AppMenuCommand.updates)) { _ in
             showUpdatesSheet = true
         }
+        .onReceive(NotificationCenter.default.publisher(for: AppMenuCommand.checkDependencies)) { _ in
+            checkDependencies()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: AppMenuCommand.installKubectl)) { _ in
+            installKubectlDependency()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: AppMenuCommand.installPlugins)) { _ in
+            installPluginDependencies()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: AppMenuCommand.installAllDependencies)) { _ in
+            installAllDependencies()
+        }
         .onChange(of: section) { _ in
             ensureSelectionForCurrentSection()
         }
@@ -192,6 +220,19 @@ struct AppView: View {
         }
         .onChange(of: viewModel.currentContext) { _ in
             viewModel.registerEdit(reason: "current-context-change")
+            resetProjectConnectionTestState()
+        }
+        .onChange(of: viewModel.currentPath) { _ in
+            resetProjectConnectionTestState()
+        }
+        .onChange(of: selectedContextIDs) { _ in
+            resetProjectConnectionTestState()
+        }
+        .onChange(of: selectedUserIDs) { _ in
+            isSaTokenReissueInProgress = false
+        }
+        .onChange(of: serviceAccountKubeconfigText) { _ in
+            resetGeneratedConnectionTestState()
         }
         .sheet(isPresented: $showImportSheet) {
             ImportSnippetSheet(
@@ -350,12 +391,14 @@ struct AppView: View {
                 isLoadingNamespaces: isLoadingServiceAccountNamespaces,
                 isLoadingServiceAccounts: isLoadingServiceAccounts,
                 onGenerate: { generateServiceAccountKubeconfig() },
+                onTestConnection: { testGeneratedServiceAccountConnection() },
                 onRefreshNamespaces: { refreshServiceAccountNamespaces() },
                 onRefreshServiceAccounts: { refreshServiceAccountsForSelectedNamespace() },
                 onNamespacePicked: { refreshServiceAccountsForSelectedNamespace() },
                 onSaveToFile: { saveServiceAccountKubeconfigToFile() },
-                onAddToMyKubeconfig: { addServiceAccountKubeconfigToDefault() },
-                onClose: { showServiceAccountKubeconfigSheet = false }
+                onAddToProject: { addServiceAccountKubeconfigToProject() },
+                connectionTestState: generatedConnectionTestState,
+                onClose: { closeServiceAccountKubeconfigSheet() }
             )
             .frame(minWidth: 1000, minHeight: 700)
         }
@@ -394,6 +437,7 @@ struct AppView: View {
                             sidebarButton(
                                 title: context.name,
                                 warning: viewModel.contextWarning(context),
+                                tokenExpiryHint: contextTokenExpiryHint(context),
                                 includeInExport: context.includeInExport,
                                 isSelected: selectedContextIDs.contains(context.id),
                                 isCurrent: viewModel.currentContext == context.name
@@ -431,6 +475,7 @@ struct AppView: View {
                             sidebarButton(
                                 title: user.name,
                                 warning: viewModel.userWarning(user),
+                                tokenExpiryHint: userTokenExpiryHint(user),
                                 includeInExport: user.includeInExport,
                                 isSelected: selectedUserIDs.contains(user.id)
                             ) {
@@ -538,6 +583,12 @@ struct AppView: View {
                 openServiceAccountKubeconfigSheet()
             }
 
+            Button(projectConnectionButtonTitle) {
+                testProjectConnection()
+            }
+            .foregroundStyle(projectConnectionButtonColor)
+            .disabled(projectConnectionTestState == .testing)
+
             Menu("History") {
                 Button("Undo Last Change") { viewModel.undoLastChange() }
                     .disabled(!viewModel.canUndo)
@@ -558,6 +609,10 @@ struct AppView: View {
     @ViewBuilder
     private var contextDetail: some View {
         if let id = selectedContextId(), let index = viewModel.contexts.firstIndex(where: { $0.id == id }) {
+            let context = viewModel.contexts[index]
+            let contextUserName = context.fieldValue("user").trimmingCharacters(in: .whitespacesAndNewlines)
+            let contextUser = viewModel.users.first(where: { $0.name == contextUserName })
+            let contextSATokenInfo = contextUser.flatMap { viewModel.serviceAccountTokenInfo(for: $0) }
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     if let warning = viewModel.contextWarning(viewModel.contexts[index]) {
@@ -589,6 +644,33 @@ struct AppView: View {
                         }
                     )
                     .id(viewModel.contexts[index].id)
+
+                    if let contextUser, let contextSATokenInfo {
+                        GroupBox("ServiceAccount Token") {
+                            VStack(alignment: .leading, spacing: 10) {
+                                HStack(spacing: 8) {
+                                    Text("Subject:")
+                                        .foregroundStyle(.secondary)
+                                    Text("\(contextSATokenInfo.namespace)/\(contextSATokenInfo.serviceAccountName)")
+                                        .font(.body.monospaced())
+                                }
+                                HStack(spacing: 8) {
+                                    Text("Expires:")
+                                        .foregroundStyle(.secondary)
+                                    Text(contextSATokenInfo.expiresAt.formatted(date: .abbreviated, time: .standard))
+                                        .font(.body.monospaced())
+                                    Text("(\(tokenTTLText(until: contextSATokenInfo.expiresAt)))")
+                                        .foregroundStyle(contextSATokenInfo.expiresAt > Date() ? Color.secondary : Color.red)
+                                }
+                                Button(isSaTokenReissueInProgress ? "Reissuing token..." : "Reissue Token") {
+                                    reissueServiceAccountToken(userID: contextUser.id, contextID: context.id)
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .disabled(isSaTokenReissueInProgress)
+                            }
+                            .padding(.vertical, 4)
+                        }
+                    }
 
                     HStack {
                         Spacer()
@@ -657,6 +739,7 @@ struct AppView: View {
             let user = viewModel.users[index]
             let oidcMode = viewModel.userOIDCAuthMode(user)
             let linkedContexts = viewModel.contextsLinkedToUser(user.name)
+            let saTokenInfo = viewModel.serviceAccountTokenInfo(for: user)
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     if let warning = viewModel.userWarning(viewModel.users[index]) {
@@ -734,6 +817,67 @@ struct AppView: View {
                         .padding(.vertical, 4)
                     }
 
+                    GroupBox("ServiceAccount Token") {
+                        VStack(alignment: .leading, spacing: 10) {
+                            if let saTokenInfo {
+                                HStack(spacing: 8) {
+                                    Text("Subject:")
+                                        .foregroundStyle(.secondary)
+                                    Text("\(saTokenInfo.namespace)/\(saTokenInfo.serviceAccountName)")
+                                        .font(.body.monospaced())
+                                }
+                                HStack(spacing: 8) {
+                                    Text("Expires:")
+                                        .foregroundStyle(.secondary)
+                                    Text(saTokenInfo.expiresAt.formatted(date: .abbreviated, time: .standard))
+                                        .font(.body.monospaced())
+                                    Text("(\(tokenTTLText(until: saTokenInfo.expiresAt)))")
+                                        .foregroundStyle(saTokenInfo.expiresAt > Date() ? Color.secondary : Color.red)
+                                }
+
+                                if !linkedContexts.isEmpty {
+                                    Picker("Context", selection: Binding<UUID?>(
+                                        get: {
+                                            if let selected = saTokenReissueContextID,
+                                               linkedContexts.contains(where: { $0.id == selected }) {
+                                                return selected
+                                            }
+                                            return linkedContexts.first?.id
+                                        },
+                                        set: { saTokenReissueContextID = $0 }
+                                    )) {
+                                        ForEach(linkedContexts) { context in
+                                            Text(context.name).tag(Optional(context.id))
+                                        }
+                                    }
+                                    .pickerStyle(.menu)
+                                    .onAppear {
+                                        syncSaTokenReissueContext(with: linkedContexts)
+                                    }
+                                    .onChange(of: linkedContexts.map(\.id)) { _ in
+                                        syncSaTokenReissueContext(with: linkedContexts)
+                                    }
+                                }
+
+                                Button(isSaTokenReissueInProgress ? "Reissuing token..." : "Reissue Token") {
+                                    if let contextID = saTokenReissueContextID ?? linkedContexts.first?.id {
+                                        reissueServiceAccountToken(userID: user.id, contextID: contextID)
+                                    }
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .disabled(
+                                    isSaTokenReissueInProgress ||
+                                    (saTokenReissueContextID == nil && linkedContexts.first == nil)
+                                )
+                            } else {
+                                Text("No renewable ServiceAccount JWT token found in this user token field.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+
                     GroupBox("Relations") {
                         HStack(alignment: .top, spacing: 24) {
                             RelatedItemsColumn(
@@ -790,16 +934,27 @@ struct AppView: View {
     }
 
     @ViewBuilder
-    private func sidebarRow(title: String, warning: String?, includeInExport: Bool, isCurrent: Bool = false) -> some View {
+    private func sidebarRow(
+        title: String,
+        warning: String?,
+        tokenExpiryHint: String?,
+        includeInExport: Bool,
+        isCurrent: Bool = false
+    ) -> some View {
+        let helpText = sidebarHelpText(warning: warning, tokenExpiryHint: tokenExpiryHint)
         HStack(spacing: 8) {
             Text(title)
                 .lineLimit(1)
                 .fontWeight(isCurrent ? .bold : .regular)
-                .foregroundColor(warning == nil ? (includeInExport ? .primary : .secondary) : .red)
+                .foregroundColor(sidebarTitleColor(warning: warning, tokenExpiryHint: tokenExpiryHint, includeInExport: includeInExport))
             if let warning {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .foregroundStyle(.red)
                     .help(warning)
+            } else if let tokenExpiryHint {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.yellow)
+                    .help(tokenExpiryHint)
             }
             if !includeInExport {
                 Text("(hidden)")
@@ -807,13 +962,14 @@ struct AppView: View {
                     .foregroundStyle(.secondary)
             }
         }
-        .help(warning ?? "OK")
+        .help(helpText)
     }
 
     @ViewBuilder
     private func sidebarButton(
         title: String,
         warning: String?,
+        tokenExpiryHint: String? = nil,
         includeInExport: Bool,
         isSelected: Bool,
         isCurrent: Bool = false,
@@ -835,7 +991,13 @@ struct AppView: View {
             }
             Button(action: action) {
                 HStack(spacing: 0) {
-                    sidebarRow(title: title, warning: warning, includeInExport: includeInExport, isCurrent: isCurrent)
+                    sidebarRow(
+                        title: title,
+                        warning: warning,
+                        tokenExpiryHint: tokenExpiryHint,
+                        includeInExport: includeInExport,
+                        isCurrent: isCurrent
+                    )
                     Spacer(minLength: 0)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -869,6 +1031,43 @@ struct AppView: View {
         }
     }
 
+    private func sidebarTitleColor(warning: String?, tokenExpiryHint: String?, includeInExport: Bool) -> Color {
+        if warning != nil {
+            return .red
+        }
+        if tokenExpiryHint != nil {
+            return .yellow
+        }
+        return includeInExport ? .primary : .secondary
+    }
+
+    private func sidebarHelpText(warning: String?, tokenExpiryHint: String?) -> String {
+        if let warning { return warning }
+        if let tokenExpiryHint { return tokenExpiryHint }
+        return "OK"
+    }
+
+    private func contextTokenExpiryHint(_ context: NamedItem) -> String? {
+        let userName = context.fieldValue("user").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let user = viewModel.users.first(where: { $0.name == userName }) else {
+            return nil
+        }
+        return userTokenExpiryHint(user)
+    }
+
+    private func userTokenExpiryHint(_ user: NamedItem) -> String? {
+        guard let info = viewModel.serviceAccountTokenInfo(for: user) else {
+            return nil
+        }
+        let remaining = info.expiresAt.timeIntervalSinceNow
+        let twoWeeks: TimeInterval = 14 * 24 * 60 * 60
+        guard remaining > 0 && remaining <= twoWeeks else {
+            return nil
+        }
+        let expiresText = info.expiresAt.formatted(date: .abbreviated, time: .standard)
+        return "Token expires soon (under 14 days). Expires at \(expiresText)."
+    }
+
     private func activateContextFromSidebar(_ id: UUID) {
         selectedContextIDs = [id]
         selectedClusterIDs = []
@@ -895,6 +1094,7 @@ struct AppView: View {
             do {
                 try viewModel.load(from: url)
                 adoptSelectionFromViewModel()
+                resetProjectConnectionTestState()
             } catch {
                 viewModel.statusMessage = "Ошибка загрузки: \(error.localizedDescription)"
             }
@@ -935,6 +1135,69 @@ struct AppView: View {
             try viewModel.backup()
         } catch {
             viewModel.statusMessage = "Ошибка бэкапа: \(error.localizedDescription)"
+        }
+    }
+
+    private func checkDependencies() {
+        guard !isDependencyActionInProgress else { return }
+        isDependencyActionInProgress = true
+        viewModel.statusMessage = "Checking dependencies..."
+        Task {
+            defer { isDependencyActionInProgress = false }
+            let status = await viewModel.checkDependencyStatus()
+            let summary = [
+                "brew: \(status.hasBrew ? "OK" : "MISSING")",
+                "kubectl: \(status.hasKubectl ? "OK" : "MISSING")",
+                "krew: \(status.hasKrew ? "OK" : "MISSING")",
+                "oidc-login: \(status.hasOIDCPlugin ? "OK" : "MISSING")",
+                "view-serviceaccount-kubeconfig: \(status.hasViewServiceAccountPlugin ? "OK" : "MISSING")"
+            ].joined(separator: ", ")
+            viewModel.statusMessage = "Dependencies: \(summary)"
+        }
+    }
+
+    private func installKubectlDependency() {
+        guard !isDependencyActionInProgress else { return }
+        isDependencyActionInProgress = true
+        viewModel.statusMessage = "Installing kubectl..."
+        Task {
+            defer { isDependencyActionInProgress = false }
+            do {
+                try await viewModel.installKubectlDependency()
+            } catch {
+                viewModel.statusMessage = "kubectl install error: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func installPluginDependencies() {
+        guard !isDependencyActionInProgress else { return }
+        isDependencyActionInProgress = true
+        viewModel.statusMessage = "Installing kubectl plugins..."
+        Task {
+            defer { isDependencyActionInProgress = false }
+            do {
+                try await viewModel.installPluginDependencies()
+            } catch {
+                viewModel.statusMessage = "Plugin install error: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func installAllDependencies() {
+        guard !isDependencyActionInProgress else { return }
+        isDependencyActionInProgress = true
+        viewModel.statusMessage = "Installing all dependencies..."
+        Task {
+            defer { isDependencyActionInProgress = false }
+            do {
+                try await viewModel.installAllDependencies()
+                let status = await viewModel.checkDependencyStatus()
+                let ready = status.hasKubectl && status.hasOIDCPlugin && status.hasViewServiceAccountPlugin
+                viewModel.statusMessage = ready ? "All required dependencies are installed" : "Install completed with missing items, run Check Dependencies"
+            } catch {
+                viewModel.statusMessage = "Dependency install error: \(error.localizedDescription)"
+            }
         }
     }
 
@@ -1059,10 +1322,21 @@ struct AppView: View {
 
     private func openServiceAccountKubeconfigSheet() {
         serviceAccountMessage = "Select context, set ServiceAccount parameters and click Generate."
+        serviceAccountLookupToken = UUID()
         availableServiceAccountNamespaces = []
         availableServiceAccounts = []
+        isLoadingServiceAccountNamespaces = false
+        isLoadingServiceAccounts = false
+        generatedConnectionTestState = .idle
         showServiceAccountKubeconfigSheet = true
         refreshServiceAccountNamespaces()
+    }
+
+    private func closeServiceAccountKubeconfigSheet() {
+        serviceAccountLookupToken = UUID()
+        isLoadingServiceAccountNamespaces = false
+        isLoadingServiceAccounts = false
+        showServiceAccountKubeconfigSheet = false
     }
 
     private func generateServiceAccountKubeconfig() {
@@ -1112,7 +1386,7 @@ struct AppView: View {
         }
     }
 
-    private func addServiceAccountKubeconfigToDefault() {
+    private func addServiceAccountKubeconfigToProject() {
         let trimmed = serviceAccountKubeconfigText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             serviceAccountMessage = "Generate kubeconfig first."
@@ -1120,22 +1394,125 @@ struct AppView: View {
         }
 
         do {
-            let destination = try viewModel.mergeKubeconfigTextIntoDefault(serviceAccountKubeconfigText)
-            serviceAccountMessage = "Added to \(destination.path)"
+            try viewModel.mergeImportTextIntoProject(serviceAccountKubeconfigText)
+            adoptSelectionFromViewModel()
+            serviceAccountMessage = "Added to current project."
         } catch {
             serviceAccountMessage = "Merge error: \(error.localizedDescription)"
         }
     }
 
+    private func testGeneratedServiceAccountConnection() {
+        guard generatedConnectionTestState != .testing else { return }
+        let trimmed = serviceAccountKubeconfigText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            serviceAccountMessage = "Generate kubeconfig first."
+            return
+        }
+
+        let token = UUID()
+        generatedConnectionTestToken = token
+        generatedConnectionTestState = .testing
+        Task {
+            do {
+                _ = try await viewModel.testConnectionWithKubeconfigText(serviceAccountKubeconfigText)
+                guard generatedConnectionTestToken == token else { return }
+                generatedConnectionTestState = .ok
+                scheduleGeneratedConnectionReset(token: token)
+            } catch {
+                guard generatedConnectionTestToken == token else { return }
+                generatedConnectionTestState = .failed
+                serviceAccountMessage = "Connection test error: \(error.localizedDescription)"
+                scheduleGeneratedConnectionReset(token: token)
+            }
+        }
+    }
+
+    private func testProjectConnection() {
+        guard projectConnectionTestState != .testing else { return }
+        let token = UUID()
+        projectConnectionTestToken = token
+        projectConnectionTestState = .testing
+        let contextID = selectedContextId()
+        Task {
+            do {
+                _ = try await viewModel.testConnectionWithCurrentProject(contextID: contextID)
+                guard projectConnectionTestToken == token else { return }
+                projectConnectionTestState = .ok
+                scheduleProjectConnectionReset(token: token)
+            } catch {
+                guard projectConnectionTestToken == token else { return }
+                projectConnectionTestState = .failed
+                scheduleProjectConnectionReset(token: token)
+            }
+        }
+    }
+
+    private var projectConnectionButtonTitle: String {
+        switch projectConnectionTestState {
+        case .idle:
+            return "Test Connection"
+        case .testing:
+            return "Testing..."
+        case .ok:
+            return "Test OK"
+        case .failed:
+            return "Test Failed"
+        }
+    }
+
+    private var projectConnectionButtonColor: Color {
+        switch projectConnectionTestState {
+        case .ok:
+            return .green
+        case .failed:
+            return .red
+        default:
+            return .primary
+        }
+    }
+
+    private func resetProjectConnectionTestState() {
+        projectConnectionTestToken = UUID()
+        projectConnectionTestState = .idle
+    }
+
+    private func scheduleProjectConnectionReset(token: UUID) {
+        Task {
+            try? await Task.sleep(for: .seconds(5))
+            guard projectConnectionTestToken == token else { return }
+            projectConnectionTestState = .idle
+        }
+    }
+
+    private func resetGeneratedConnectionTestState() {
+        generatedConnectionTestToken = UUID()
+        generatedConnectionTestState = .idle
+    }
+
+    private func scheduleGeneratedConnectionReset(token: UUID) {
+        Task {
+            try? await Task.sleep(for: .seconds(5))
+            guard generatedConnectionTestToken == token else { return }
+            generatedConnectionTestState = .idle
+        }
+    }
+
     private func refreshServiceAccountNamespaces() {
         guard !isLoadingServiceAccountNamespaces else { return }
+        let token = serviceAccountLookupToken
         isLoadingServiceAccountNamespaces = true
         serviceAccountMessage = "Loading namespaces from cluster API..."
         let contextID = selectedContextId()
         Task {
-            defer { isLoadingServiceAccountNamespaces = false }
+            defer {
+                if serviceAccountLookupToken == token {
+                    isLoadingServiceAccountNamespaces = false
+                }
+            }
             do {
                 let namespaces = try await viewModel.fetchClusterNamespaces(contextID: contextID)
+                guard serviceAccountLookupToken == token else { return }
                 availableServiceAccountNamespaces = namespaces
 
                 if !namespaces.contains(serviceAccountNamespace) {
@@ -1149,6 +1526,7 @@ struct AppView: View {
                 serviceAccountMessage = "Namespaces loaded: \(namespaces.count)"
                 refreshServiceAccountsForSelectedNamespace()
             } catch {
+                guard serviceAccountLookupToken == token else { return }
                 serviceAccountMessage = "Namespaces fetch error: \(error.localizedDescription)"
             }
         }
@@ -1156,6 +1534,7 @@ struct AppView: View {
 
     private func refreshServiceAccountsForSelectedNamespace() {
         guard !isLoadingServiceAccounts else { return }
+        let token = serviceAccountLookupToken
         let namespace = serviceAccountNamespace.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !namespace.isEmpty else {
             serviceAccountMessage = "Namespace is required to load serviceaccounts"
@@ -1166,15 +1545,21 @@ struct AppView: View {
         serviceAccountMessage = "Loading serviceaccounts for namespace '\(namespace)'..."
         let contextID = selectedContextId()
         Task {
-            defer { isLoadingServiceAccounts = false }
+            defer {
+                if serviceAccountLookupToken == token {
+                    isLoadingServiceAccounts = false
+                }
+            }
             do {
                 let accounts = try await viewModel.fetchClusterServiceAccounts(contextID: contextID, namespace: namespace)
+                guard serviceAccountLookupToken == token else { return }
                 availableServiceAccounts = accounts
                 if !accounts.contains(serviceAccountName), let first = accounts.first {
                     serviceAccountName = first
                 }
                 serviceAccountMessage = "ServiceAccounts loaded: \(accounts.count) in namespace '\(namespace)'"
             } catch {
+                guard serviceAccountLookupToken == token else { return }
                 serviceAccountMessage = "ServiceAccounts fetch error: \(error.localizedDescription)"
             }
         }
@@ -1185,6 +1570,41 @@ struct AppView: View {
             return
         }
         oidcReauthContextID = contexts.first?.id
+    }
+
+    private func syncSaTokenReissueContext(with contexts: [NamedItem]) {
+        if let selected = saTokenReissueContextID, contexts.contains(where: { $0.id == selected }) {
+            return
+        }
+        saTokenReissueContextID = contexts.first?.id
+    }
+
+    private func tokenTTLText(until expiresAt: Date) -> String {
+        let remaining = Int(expiresAt.timeIntervalSinceNow)
+        if remaining <= 0 {
+            return "expired"
+        }
+        if remaining >= 3600 {
+            return "\(remaining / 3600)h"
+        }
+        if remaining >= 60 {
+            return "\(remaining / 60)m"
+        }
+        return "\(remaining)s"
+    }
+
+    private func reissueServiceAccountToken(userID: UUID, contextID: UUID) {
+        guard !isSaTokenReissueInProgress else { return }
+        isSaTokenReissueInProgress = true
+        Task {
+            defer { isSaTokenReissueInProgress = false }
+            do {
+                let info = try await viewModel.reissueServiceAccountToken(userID: userID, contextID: contextID)
+                viewModel.statusMessage = "Token reissued. Expires at \(info.expiresAt.formatted(date: .abbreviated, time: .standard))"
+            } catch {
+                viewModel.statusMessage = "Token reissue error: \(error.localizedDescription)"
+            }
+        }
     }
 
     private func makeCurrentAndSave() {
@@ -2089,11 +2509,13 @@ struct ServiceAccountKubeconfigSheet: View {
     let isLoadingNamespaces: Bool
     let isLoadingServiceAccounts: Bool
     var onGenerate: () -> Void
+    var onTestConnection: () -> Void
     var onRefreshNamespaces: () -> Void
     var onRefreshServiceAccounts: () -> Void
     var onNamespacePicked: () -> Void
     var onSaveToFile: () -> Void
-    var onAddToMyKubeconfig: () -> Void
+    var onAddToProject: () -> Void
+    let connectionTestState: ConnectionTestState
     var onClose: () -> Void
 
     private var filteredNamespaces: [String] {
@@ -2126,6 +2548,14 @@ struct ServiceAccountKubeconfigSheet: View {
                                     onNamespacePicked()
                                 }
                             }
+                        Button {
+                            namespace = ""
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Clear namespace filter")
                         Menu("Pick Namespace (\(filteredNamespaces.count))") {
                             ForEach(filteredNamespaces.prefix(100), id: \.self) { candidate in
                                 Button(candidate) {
@@ -2143,6 +2573,14 @@ struct ServiceAccountKubeconfigSheet: View {
 
                     HStack(spacing: 10) {
                         TextField("ServiceAccount name", text: $serviceAccountName)
+                        Button {
+                            serviceAccountName = ""
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Clear serviceaccount filter")
                         Menu("Pick ServiceAccount (\(filteredServiceAccounts.count))") {
                             ForEach(filteredServiceAccounts.prefix(100), id: \.self) { candidate in
                                 Button(candidate) {
@@ -2178,10 +2616,14 @@ struct ServiceAccountKubeconfigSheet: View {
                     .buttonStyle(.borderedProminent)
                     .disabled(isGenerating)
 
+                Button(generatedTestButtonTitle) { onTestConnection() }
+                    .tint(generatedTestButtonTint)
+                    .disabled(connectionTestState == .testing || kubeconfigText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
                 Button("Save to File") { onSaveToFile() }
                     .disabled(kubeconfigText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
-                Button("Add to My Kubeconfig") { onAddToMyKubeconfig() }
+                Button("Add to Project") { onAddToProject() }
                     .disabled(kubeconfigText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
                 Spacer()
@@ -2194,6 +2636,30 @@ struct ServiceAccountKubeconfigSheet: View {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return source }
         return source.filter { $0.localizedCaseInsensitiveContains(trimmed) }
+    }
+
+    private var generatedTestButtonTitle: String {
+        switch connectionTestState {
+        case .idle:
+            return "Test Connection"
+        case .testing:
+            return "Testing..."
+        case .ok:
+            return "Test OK"
+        case .failed:
+            return "Test Failed"
+        }
+    }
+
+    private var generatedTestButtonTint: Color? {
+        switch connectionTestState {
+        case .ok:
+            return .green
+        case .failed:
+            return .red
+        default:
+            return nil
+        }
     }
 }
 

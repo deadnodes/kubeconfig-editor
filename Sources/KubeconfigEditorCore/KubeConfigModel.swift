@@ -79,6 +79,42 @@ public enum UserOIDCAuthMode: String, Hashable {
     case legacy
 }
 
+public struct ServiceAccountTokenInfo: Hashable {
+    public let namespace: String
+    public let serviceAccountName: String
+    public let expiresAt: Date
+    public let issuedAt: Date?
+
+    public init(namespace: String, serviceAccountName: String, expiresAt: Date, issuedAt: Date?) {
+        self.namespace = namespace
+        self.serviceAccountName = serviceAccountName
+        self.expiresAt = expiresAt
+        self.issuedAt = issuedAt
+    }
+}
+
+public struct DependencyStatus: Hashable {
+    public let hasBrew: Bool
+    public let hasKubectl: Bool
+    public let hasKrew: Bool
+    public let hasOIDCPlugin: Bool
+    public let hasViewServiceAccountPlugin: Bool
+
+    public init(
+        hasBrew: Bool,
+        hasKubectl: Bool,
+        hasKrew: Bool,
+        hasOIDCPlugin: Bool,
+        hasViewServiceAccountPlugin: Bool
+    ) {
+        self.hasBrew = hasBrew
+        self.hasKubectl = hasKubectl
+        self.hasKrew = hasKrew
+        self.hasOIDCPlugin = hasOIDCPlugin
+        self.hasViewServiceAccountPlugin = hasViewServiceAccountPlugin
+    }
+}
+
 public struct MergeFieldChange: Identifiable, Hashable {
     public let id: String
     public let entity: MergeEntityType
@@ -150,6 +186,7 @@ public final class KubeConfigViewModel: ObservableObject {
     private var undoStack: [HistorySnapshot] = []
     private var redoStack: [HistorySnapshot] = []
     private var lastSnapshotYAML: String = ""
+    private var lastPersistedWorkspaceYAML: String = ""
     private var suppressHistoryTracking = false
     private var currentSessionKey: String = "unsaved-\(UUID().uuidString)"
     private var watchedFileURL: URL?
@@ -250,6 +287,7 @@ public final class KubeConfigViewModel: ObservableObject {
         try? createDraftFile(fromYAML: yaml)
         try? syncGitWorkingTree(yaml: yaml)
         resetHistory(reason: "new-empty")
+        lastPersistedWorkspaceYAML = (try? buildWorkspaceYAML()) ?? ""
         suppressHistoryTracking = false
         hasUnsavedChanges = false
         triggerBackgroundValidationIfNeeded()
@@ -307,7 +345,9 @@ public final class KubeConfigViewModel: ObservableObject {
             try restoreDetachedStore(for: url)
         }
 
-        if let first = contexts.first {
+        if let current = contexts.first(where: { $0.name == currentContext }) {
+            selection = .context(current.id)
+        } else if let first = contexts.first {
             selection = .context(first.id)
         } else if let first = clusters.first {
             selection = .cluster(first.id)
@@ -329,6 +369,7 @@ public final class KubeConfigViewModel: ObservableObject {
         try? ensureInitialGitSnapshot(yaml: workspaceYAML, reason: "initial-load")
         restartWatchingCurrentFile(at: url)
         resetHistory(reason: "load")
+        lastPersistedWorkspaceYAML = workspaceYAML
         suppressHistoryTracking = false
         hasUnsavedChanges = false
         triggerBackgroundValidationIfNeeded()
@@ -436,6 +477,87 @@ public final class KubeConfigViewModel: ObservableObject {
         }
 
         statusMessage = "Импортировано: contexts \(parsed.contexts.count), clusters \(parsed.clusters.count), users \(parsed.users.count)"
+    }
+
+    // Specialized merge for generated SA kubeconfigs: reuse existing equivalent clusters/users.
+    public func mergeImportTextIntoProject(_ text: String) throws {
+        var parsed = try parseKubeconfigText(text)
+
+        var importedClusters: [NamedItem] = []
+        var usedClusterNames = Set(clusters.map(\.name))
+        var clusterNameMap: [String: String] = [:]
+        for index in parsed.clusters.indices {
+            let oldName = parsed.clusters[index].name
+            if let existing = clusters.first(where: { areFieldsEquivalent($0.fields, parsed.clusters[index].fields) }) {
+                clusterNameMap[oldName] = existing.name
+                continue
+            }
+            let newName = makeUniqueName(base: oldName, used: &usedClusterNames)
+            parsed.clusters[index].name = newName
+            clusterNameMap[oldName] = newName
+            importedClusters.append(parsed.clusters[index])
+        }
+
+        var importedUsers: [NamedItem] = []
+        var usedUserNames = Set(users.map(\.name))
+        var userNameMap: [String: String] = [:]
+        for index in parsed.users.indices {
+            let oldName = parsed.users[index].name
+            if let existing = users.first(where: { areFieldsEquivalent($0.fields, parsed.users[index].fields) }) {
+                userNameMap[oldName] = existing.name
+                continue
+            }
+            let newName = makeUniqueName(base: oldName, used: &usedUserNames)
+            parsed.users[index].name = newName
+            userNameMap[oldName] = newName
+            importedUsers.append(parsed.users[index])
+        }
+
+        var importedContexts: [NamedItem] = []
+        var usedContextNames = Set(contexts.map(\.name))
+        var contextNameMap: [String: String] = [:]
+        for index in parsed.contexts.indices {
+            let oldName = parsed.contexts[index].name
+
+            let clusterRef = parsed.contexts[index].fieldValue("cluster")
+            if let mapped = clusterNameMap[clusterRef], !clusterRef.isEmpty {
+                parsed.contexts[index].setField("cluster", value: mapped)
+            }
+
+            let userRef = parsed.contexts[index].fieldValue("user")
+            if let mapped = userNameMap[userRef], !userRef.isEmpty {
+                parsed.contexts[index].setField("user", value: mapped)
+            }
+
+            if let existing = contexts.first(where: { $0.name == oldName && areFieldsEquivalent($0.fields, parsed.contexts[index].fields) }) {
+                contextNameMap[oldName] = existing.name
+                continue
+            }
+
+            let newName = makeUniqueName(base: oldName, used: &usedContextNames)
+            parsed.contexts[index].name = newName
+            contextNameMap[oldName] = newName
+            importedContexts.append(parsed.contexts[index])
+        }
+
+        clusters.append(contentsOf: importedClusters)
+        users.append(contentsOf: importedUsers)
+        contexts.append(contentsOf: importedContexts)
+
+        if currentContext.isEmpty {
+            let importedCurrent = contextNameMap[parsed.currentContext]
+            currentContext = importedCurrent ?? importedContexts.first?.name ?? ""
+        }
+
+        if let first = importedContexts.first {
+            selection = .context(first.id)
+        } else if let first = importedClusters.first {
+            selection = .cluster(first.id)
+        } else if let first = importedUsers.first {
+            selection = .user(first.id)
+        }
+
+        statusMessage = "Added to project: contexts \(importedContexts.count), clusters \(importedClusters.count), users \(importedUsers.count)"
     }
 
     public func buildContextMergePreview(importText: String, intoContextID: UUID, importedContextName: String? = nil) throws -> ContextMergePreview {
@@ -585,6 +707,7 @@ public final class KubeConfigViewModel: ObservableObject {
         try? syncGitWorkingTree(yaml: workspaceYAML)
         try? commitGitSnapshot(yaml: workspaceYAML, reason: "save")
         restartWatchingCurrentFile(at: url)
+        lastPersistedWorkspaceYAML = workspaceYAML
         hasUnsavedChanges = false
         if let kubectlInfo {
             validationMessage = kubectlInfo
@@ -868,6 +991,83 @@ public final class KubeConfigViewModel: ObservableObject {
         }
     }
 
+    public func serviceAccountTokenInfo(for user: NamedItem) -> ServiceAccountTokenInfo? {
+        let token = user.fieldValue("token").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else { return nil }
+        return parseServiceAccountTokenInfo(from: token)
+    }
+
+    public func reissueServiceAccountToken(
+        userID: UUID,
+        contextID: UUID?
+    ) async throws -> ServiceAccountTokenInfo {
+        guard let userIndex = users.firstIndex(where: { $0.id == userID }) else {
+            throw NSError(domain: "KubeconfigEditor", code: 1061, userInfo: [NSLocalizedDescriptionKey: "User not found"])
+        }
+
+        let user = users[userIndex]
+        guard let tokenInfo = serviceAccountTokenInfo(for: user) else {
+            throw NSError(domain: "KubeconfigEditor", code: 1062, userInfo: [NSLocalizedDescriptionKey: "Selected user has no renewable ServiceAccount token"])
+        }
+
+        let contextName: String
+        if let contextID, let explicit = contexts.first(where: { $0.id == contextID })?.name {
+            contextName = explicit
+        } else if let current = contexts.first(where: { $0.name == currentContext && $0.fieldValue("user") == user.name })?.name {
+            contextName = current
+        } else if let linked = contexts.first(where: { $0.fieldValue("user") == user.name })?.name {
+            contextName = linked
+        } else {
+            throw NSError(domain: "KubeconfigEditor", code: 1063, userInfo: [NSLocalizedDescriptionKey: "No context linked to selected user"])
+        }
+
+        let duration: String = {
+            guard let issuedAt = tokenInfo.issuedAt else { return "8760h" }
+            let seconds = Int(tokenInfo.expiresAt.timeIntervalSince(issuedAt))
+            guard seconds > 0 else { return "8760h" }
+            return "\(seconds)s"
+        }()
+
+        let kubeconfigPath = (currentPath ?? defaultKubeconfigURL).path
+        let command: [String] = [
+            "kubectl",
+            "--kubeconfig", kubeconfigPath,
+            "--context", contextName,
+            "create",
+            "token",
+            tokenInfo.serviceAccountName,
+            "-n",
+            tokenInfo.namespace,
+            "--duration=\(duration)"
+        ]
+
+        let runner = externalCommandRunner
+        let tokenResult = await Task.detached(priority: .userInitiated) {
+            runner(command)
+        }.value
+
+        guard tokenResult.exitCode == 0 else {
+            let details = tokenResult.stderr.isEmpty ? tokenResult.stdout : tokenResult.stderr
+            throw NSError(
+                domain: "KubeconfigEditor",
+                code: 1064,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to reissue SA token: \(details.isEmpty ? "unknown error" : details)"]
+            )
+        }
+
+        let newToken = tokenResult.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !newToken.isEmpty else {
+            throw NSError(domain: "KubeconfigEditor", code: 1065, userInfo: [NSLocalizedDescriptionKey: "kubectl returned empty token"])
+        }
+        guard let newTokenInfo = parseServiceAccountTokenInfo(from: newToken) else {
+            throw NSError(domain: "KubeconfigEditor", code: 1066, userInfo: [NSLocalizedDescriptionKey: "New token is not a renewable ServiceAccount JWT"])
+        }
+
+        users[userIndex].setField("token", value: newToken)
+        statusMessage = "ServiceAccount token reissued for '\(tokenInfo.namespace)/\(tokenInfo.serviceAccountName)'"
+        return newTokenInfo
+    }
+
     public func generateServiceAccountKubeconfig(
         contextID: UUID?,
         serviceAccount: String,
@@ -1128,6 +1328,144 @@ public final class KubeConfigViewModel: ObservableObject {
         }
 
         return parseLineList(result.stdout)
+    }
+
+    public func testConnectionWithKubeconfigText(
+        _ kubeconfigText: String,
+        preferredContextName: String? = nil
+    ) async throws -> String {
+        let cleanText = kubeconfigText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanText.isEmpty else {
+            throw NSError(domain: "KubeconfigEditor", code: 1058, userInfo: [NSLocalizedDescriptionKey: "Kubeconfig text is empty"])
+        }
+
+        let parsed = try parseKubeconfigText(cleanText)
+        let preferred = preferredContextName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let contextName: String
+        if !preferred.isEmpty {
+            contextName = preferred
+        } else if !parsed.currentContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            contextName = parsed.currentContext
+        } else if let first = parsed.contexts.first?.name {
+            contextName = first
+        } else {
+            throw NSError(domain: "KubeconfigEditor", code: 1059, userInfo: [NSLocalizedDescriptionKey: "No contexts in kubeconfig"])
+        }
+
+        let manager = FileManager.default
+        let tempURL = manager.temporaryDirectory
+            .appendingPathComponent("kubeconfig-editor-conn-test-\(UUID().uuidString).yaml")
+        try cleanText.write(to: tempURL, atomically: true, encoding: .utf8)
+        defer { try? manager.removeItem(at: tempURL) }
+
+        let result = await runConnectionCheck(kubeconfigPath: tempURL.path, contextName: contextName)
+        if result.exitCode != 0 {
+            let details = result.stderr.isEmpty ? result.stdout : result.stderr
+            throw NSError(
+                domain: "KubeconfigEditor",
+                code: 1060,
+                userInfo: [NSLocalizedDescriptionKey: "Connection test failed: \(details.isEmpty ? "unknown error" : details)"]
+            )
+        }
+
+        let output = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        return output.isEmpty ? "Connection OK" : output
+    }
+
+    public func testConnectionWithCurrentProject(contextID: UUID?) async throws -> String {
+        let contextName = try resolveContextName(contextID: contextID)
+        let yaml = try buildCurrentYAML()
+        let manager = FileManager.default
+        let tempURL = manager.temporaryDirectory
+            .appendingPathComponent("kubeconfig-editor-project-conn-test-\(UUID().uuidString).yaml")
+        try yaml.write(to: tempURL, atomically: true, encoding: .utf8)
+        defer { try? manager.removeItem(at: tempURL) }
+
+        let result = await runConnectionCheck(kubeconfigPath: tempURL.path, contextName: contextName)
+        if result.exitCode != 0 {
+            let details = result.stderr.isEmpty ? result.stdout : result.stderr
+            throw NSError(
+                domain: "KubeconfigEditor",
+                code: 1061,
+                userInfo: [NSLocalizedDescriptionKey: "Connection test failed for context '\(contextName)': \(details.isEmpty ? "unknown error" : details)"]
+            )
+        }
+
+        let output = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        return output.isEmpty ? "Connection OK" : output
+    }
+
+    public func checkDependencyStatus() async -> DependencyStatus {
+        async let brew = hasCommand("brew")
+        async let kubectl = hasCommand("kubectl")
+        async let krew = hasCommand("kubectl-krew")
+        async let oidc = hasCommand("kubectl-oidc_login")
+        async let viewSA = hasCommand("kubectl-view-serviceaccount-kubeconfig")
+        return await DependencyStatus(
+            hasBrew: brew,
+            hasKubectl: kubectl,
+            hasKrew: krew,
+            hasOIDCPlugin: oidc,
+            hasViewServiceAccountPlugin: viewSA
+        )
+    }
+
+    public func installKubectlDependency() async throws {
+        guard await hasCommand("brew") else {
+            throw NSError(domain: "KubeconfigEditor", code: 1067, userInfo: [NSLocalizedDescriptionKey: "Homebrew is required to install kubectl"])
+        }
+        let result = await runShellCommand("brew install kubernetes-cli")
+        guard result.exitCode == 0 else {
+            let details = result.stderr.isEmpty ? result.stdout : result.stderr
+            throw NSError(domain: "KubeconfigEditor", code: 1068, userInfo: [NSLocalizedDescriptionKey: "Failed to install kubectl: \(details.isEmpty ? "unknown error" : details)"])
+        }
+        statusMessage = "kubectl installed successfully"
+    }
+
+    public func installPluginDependencies() async throws {
+        guard await hasCommand("brew") else {
+            throw NSError(domain: "KubeconfigEditor", code: 1069, userInfo: [NSLocalizedDescriptionKey: "Homebrew is required to install plugins"])
+        }
+        guard await hasCommand("kubectl") else {
+            throw NSError(domain: "KubeconfigEditor", code: 1070, userInfo: [NSLocalizedDescriptionKey: "kubectl is required before plugin installation"])
+        }
+
+        if !(await hasCommand("kubectl-krew")) {
+            let installKrewScript = """
+            set -e
+            cd "$(mktemp -d)"
+            OS="$(uname | tr '[:upper:]' '[:lower:]')"
+            ARCH="$(uname -m | sed -e 's/x86_64/amd64/' -e 's/arm64/arm64/')"
+            KREW="krew-${OS}_${ARCH}"
+            curl -fsSLO "https://github.com/kubernetes-sigs/krew/releases/latest/download/${KREW}.tar.gz"
+            tar zxvf "${KREW}.tar.gz"
+            ./${KREW} install krew
+            """
+            let krewResult = await runShellCommand(installKrewScript)
+            guard krewResult.exitCode == 0 else {
+                let details = krewResult.stderr.isEmpty ? krewResult.stdout : krewResult.stderr
+                throw NSError(domain: "KubeconfigEditor", code: 1071, userInfo: [NSLocalizedDescriptionKey: "Failed to install krew: \(details.isEmpty ? "unknown error" : details)"])
+            }
+        }
+
+        let pluginInstallScript = """
+        set -e
+        export PATH="$HOME/.krew/bin:$PATH"
+        kubectl krew install oidc-login
+        kubectl krew install view-serviceaccount-kubeconfig
+        """
+        let pluginResult = await runShellCommand(pluginInstallScript)
+        guard pluginResult.exitCode == 0 else {
+            let details = pluginResult.stderr.isEmpty ? pluginResult.stdout : pluginResult.stderr
+            throw NSError(domain: "KubeconfigEditor", code: 1072, userInfo: [NSLocalizedDescriptionKey: "Failed to install plugins: \(details.isEmpty ? "unknown error" : details)"])
+        }
+
+        statusMessage = "kubectl plugins installed (oidc-login, view-serviceaccount-kubeconfig)"
+    }
+
+    public func installAllDependencies() async throws {
+        try await installKubectlDependency()
+        try await installPluginDependencies()
     }
 
     public func deleteSelected() {
@@ -1475,7 +1813,7 @@ public final class KubeConfigViewModel: ObservableObject {
         undoStack.append(snapshot)
         redoStack.removeAll()
         lastSnapshotYAML = currentYAML
-        hasUnsavedChanges = true
+        hasUnsavedChanges = (currentYAML != lastPersistedWorkspaceYAML)
         updateUndoRedoFlags()
         writeChangeLogEntry(from: undoStack.dropLast().last?.yaml, to: currentYAML, reason: reason)
         try? createDraftFile(fromYAML: currentYAML)
@@ -1585,7 +1923,7 @@ public final class KubeConfigViewModel: ObservableObject {
         try createDraftFile(fromYAML: yaml)
         try? syncGitWorkingTree(yaml: yaml)
         resetHistory(reason: "rollback-\(version.id)")
-        hasUnsavedChanges = true
+        hasUnsavedChanges = (yaml != lastPersistedWorkspaceYAML)
         statusMessage = "Откат к версии: \(version.displayName)"
     }
 
@@ -1732,7 +2070,9 @@ public final class KubeConfigViewModel: ObservableObject {
         rootExtras.removeValue(forKey: "current-context")
         applyWorkspaceExportFlags(from: text)
 
-        if let first = contexts.first {
+        if let current = contexts.first(where: { $0.name == currentContext }) {
+            selection = .context(current.id)
+        } else if let first = contexts.first {
             selection = .context(first.id)
         } else if let first = clusters.first {
             selection = .cluster(first.id)
@@ -2042,7 +2382,7 @@ public final class KubeConfigViewModel: ObservableObject {
     private func applySnapshot(_ snapshot: HistorySnapshot, reason: String) {
         do {
             try loadFromYAML(snapshot.yaml, sourceURL: currentPath)
-            hasUnsavedChanges = true
+            hasUnsavedChanges = (snapshot.yaml != lastPersistedWorkspaceYAML)
             statusMessage = reason == "undo" ? "Отмена шага" : "Повтор шага"
             try? createDraftFile(fromYAML: snapshot.yaml)
             writeChangeLogEntry(from: nil, to: snapshot.yaml, reason: reason)
@@ -2440,6 +2780,97 @@ public final class KubeConfigViewModel: ObservableObject {
             .filter { !$0.isEmpty }
         return Array(Set(values))
             .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
+    private func parseServiceAccountTokenInfo(from token: String) -> ServiceAccountTokenInfo? {
+        let segments = token.split(separator: ".")
+        guard segments.count >= 2 else { return nil }
+        let payloadPart = String(segments[1])
+        guard let payloadData = decodeBase64URL(payloadPart),
+              let object = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any] else {
+            return nil
+        }
+
+        guard let exp = jsonNumber(from: object["exp"]) else { return nil }
+        let issuedAt = jsonNumber(from: object["iat"]).map(Date.init(timeIntervalSince1970:))
+        let expiresAt = Date(timeIntervalSince1970: exp)
+
+        guard let kubernetes = object["kubernetes.io"] as? [String: Any] else { return nil }
+        guard let namespace = kubernetes["namespace"] as? String, !namespace.isEmpty else { return nil }
+
+        let serviceAccountName: String? = {
+            if let nested = kubernetes["serviceaccount"] as? [String: Any],
+               let name = nested["name"] as? String,
+               !name.isEmpty {
+                return name
+            }
+            if let name = kubernetes["serviceaccount.name"] as? String, !name.isEmpty {
+                return name
+            }
+            return nil
+        }()
+        guard let serviceAccountName else { return nil }
+
+        return ServiceAccountTokenInfo(
+            namespace: namespace,
+            serviceAccountName: serviceAccountName,
+            expiresAt: expiresAt,
+            issuedAt: issuedAt
+        )
+    }
+
+    private func decodeBase64URL(_ value: String) -> Data? {
+        var normalized = value.replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        let mod = normalized.count % 4
+        if mod != 0 {
+            normalized += String(repeating: "=", count: 4 - mod)
+        }
+        return Data(base64Encoded: normalized)
+    }
+
+    private func jsonNumber(from value: Any?) -> TimeInterval? {
+        if let number = value as? NSNumber {
+            return number.doubleValue
+        }
+        if let string = value as? String, let parsed = Double(string) {
+            return parsed
+        }
+        return nil
+    }
+
+    private func areFieldsEquivalent(_ lhs: [KeyValueField], _ rhs: [KeyValueField]) -> Bool {
+        let left = fieldsToDictionary(lhs) as NSDictionary
+        let right = fieldsToDictionary(rhs) as NSDictionary
+        return left.isEqual(right)
+    }
+
+    private func runConnectionCheck(kubeconfigPath: String, contextName: String) async -> ExternalCommandResult {
+        let command = [
+            "kubectl",
+            "--kubeconfig", kubeconfigPath,
+            "--context", contextName,
+            "--request-timeout=5s",
+            "get",
+            "--raw=/version"
+        ]
+        let runner = externalCommandRunner
+        return await Task.detached(priority: .userInitiated) {
+            runner(command)
+        }.value
+    }
+
+    private func hasCommand(_ name: String) async -> Bool {
+        let result = await runShellCommand("command -v \(name)")
+        return result.exitCode == 0 && !result.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func runShellCommand(_ script: String) async -> ExternalCommandResult {
+        let runner = externalCommandRunner
+        let command = ["bash", "-lc", script]
+        return await Task.detached(priority: .userInitiated) {
+            runner(command)
+        }.value
     }
 
     private func replaceLocalhostServer(in clusters: [NamedItem], with replacementHost: String) -> [NamedItem] {
