@@ -157,6 +157,7 @@ public final class KubeConfigViewModel: ObservableObject {
     private var watcherRetryTask: Task<Void, Never>?
     private var watcherHealthTask: Task<Void, Never>?
     private var ignoreExternalChangesUntil = Date.distantPast
+    private let externalCommandRunner: @Sendable ([String]) -> ExternalCommandResult
 
     private struct HistorySnapshot {
         let yaml: String
@@ -187,7 +188,23 @@ public final class KubeConfigViewModel: ObservableObject {
         public let displayName: String
     }
 
-    public init() {
+    public init(
+        externalCommandRunner: (@Sendable ([String]) -> (exitCode: Int32, stdout: String, stderr: String))? = nil
+    ) {
+        if let externalCommandRunner {
+            self.externalCommandRunner = { arguments in
+                let result = externalCommandRunner(arguments)
+                return ExternalCommandResult(
+                    exitCode: result.exitCode,
+                    stdout: result.stdout,
+                    stderr: result.stderr
+                )
+            }
+        } else {
+            self.externalCommandRunner = { arguments in
+                Self.runExternalCommand(arguments: arguments)
+            }
+        }
         newEmpty()
     }
 
@@ -834,8 +851,9 @@ public final class KubeConfigViewModel: ObservableObject {
 
     public func triggerOIDCReauth(contextID: UUID) async throws {
         let command = try buildOIDCReauthCommand(contextID: contextID)
+        let runner = externalCommandRunner
         let result = await Task.detached(priority: .userInitiated) {
-            Self.runExternalCommand(arguments: command)
+            runner(command)
         }.value
 
         if result.exitCode != 0 {
@@ -848,6 +866,268 @@ public final class KubeConfigViewModel: ObservableObject {
         } else {
             statusMessage = "OIDC re-auth completed"
         }
+    }
+
+    public func generateServiceAccountKubeconfig(
+        contextID: UUID?,
+        serviceAccount: String,
+        namespace: String,
+        duration: String
+    ) async throws -> String {
+        let cleanServiceAccount = serviceAccount.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanNamespace = namespace.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanDuration = duration.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !cleanServiceAccount.isEmpty else {
+            throw NSError(domain: "KubeconfigEditor", code: 1044, userInfo: [NSLocalizedDescriptionKey: "ServiceAccount name is required"])
+        }
+        guard !cleanNamespace.isEmpty else {
+            throw NSError(domain: "KubeconfigEditor", code: 1045, userInfo: [NSLocalizedDescriptionKey: "Namespace is required"])
+        }
+        guard !cleanDuration.isEmpty else {
+            throw NSError(domain: "KubeconfigEditor", code: 1046, userInfo: [NSLocalizedDescriptionKey: "Token duration is required"])
+        }
+
+        let targetContext: NamedItem
+        if let contextID, let explicitContext = contexts.first(where: { $0.id == contextID }) {
+            targetContext = explicitContext
+        } else if let current = contexts.first(where: { $0.name == currentContext }) {
+            targetContext = current
+        } else if let first = contexts.first {
+            targetContext = first
+        } else {
+            throw NSError(domain: "KubeconfigEditor", code: 1047, userInfo: [NSLocalizedDescriptionKey: "Context not found"])
+        }
+
+        let clusterName = targetContext.fieldValue("cluster").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clusterName.isEmpty else {
+            throw NSError(domain: "KubeconfigEditor", code: 1048, userInfo: [NSLocalizedDescriptionKey: "Selected context has no cluster"])
+        }
+        guard let cluster = clusters.first(where: { $0.name == clusterName }) else {
+            throw NSError(domain: "KubeconfigEditor", code: 1049, userInfo: [NSLocalizedDescriptionKey: "Cluster '\(clusterName)' not found"])
+        }
+        let clusterPayload = fieldsToDictionary(cluster.fields)
+        let apiServer = anyToString(clusterPayload["server"]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !apiServer.isEmpty else {
+            throw NSError(domain: "KubeconfigEditor", code: 1050, userInfo: [NSLocalizedDescriptionKey: "Cluster '\(cluster.name)' has empty server endpoint"])
+        }
+
+        let kubeconfigPath = (currentPath ?? defaultKubeconfigURL).path
+        var command: [String] = ["kubectl", "--kubeconfig", kubeconfigPath]
+        if !targetContext.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            command.append(contentsOf: ["--context", targetContext.name])
+        }
+        command.append(contentsOf: [
+            "create",
+            "token",
+            cleanServiceAccount,
+            "-n",
+            cleanNamespace,
+            "--duration=\(cleanDuration)"
+        ])
+
+        let runner = externalCommandRunner
+        let tokenResult = await Task.detached(priority: .userInitiated) {
+            runner(command)
+        }.value
+        guard tokenResult.exitCode == 0 else {
+            let details = tokenResult.stderr.isEmpty ? tokenResult.stdout : tokenResult.stderr
+            throw NSError(
+                domain: "KubeconfigEditor",
+                code: 1051,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to create SA token: \(details.isEmpty ? "unknown error" : details)"]
+            )
+        }
+        let token = tokenResult.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else {
+            throw NSError(domain: "KubeconfigEditor", code: 1052, userInfo: [NSLocalizedDescriptionKey: "kubectl returned empty token"])
+        }
+
+        let generatedUserName = "sa-\(cleanNamespace)-\(cleanServiceAccount)"
+        let generatedContextName = "\(targetContext.name)-\(cleanServiceAccount)"
+        let generated: [String: Any] = [
+            "apiVersion": "v1",
+            "kind": "Config",
+            "current-context": generatedContextName,
+            "contexts": [
+                [
+                    "name": generatedContextName,
+                    "context": [
+                        "cluster": cluster.name,
+                        "user": generatedUserName,
+                        "namespace": cleanNamespace
+                    ]
+                ]
+            ],
+            "clusters": [
+                [
+                    "name": cluster.name,
+                    "cluster": clusterPayload
+                ]
+            ],
+            "users": [
+                [
+                    "name": generatedUserName,
+                    "user": [
+                        "token": token
+                    ]
+                ]
+            ]
+        ]
+
+        let yaml = try Yams.dump(object: generated)
+        statusMessage = "Generated SA kubeconfig for '\(cleanServiceAccount)' in namespace '\(cleanNamespace)'"
+        return yaml
+    }
+
+    public func mergeKubeconfigTextIntoDefault(_ kubeconfigText: String) throws -> URL {
+        let imported = try parseKubeconfigText(kubeconfigText)
+        guard !imported.contexts.isEmpty || !imported.clusters.isEmpty || !imported.users.isEmpty else {
+            throw NSError(domain: "KubeconfigEditor", code: 1053, userInfo: [NSLocalizedDescriptionKey: "Kubeconfig is empty"])
+        }
+
+        let manager = FileManager.default
+        let destination = defaultKubeconfigURL
+        try manager.createDirectory(at: defaultKubeDirectoryURL, withIntermediateDirectories: true)
+
+        var destinationContexts: [NamedItem] = []
+        var destinationClusters: [NamedItem] = []
+        var destinationUsers: [NamedItem] = []
+        var destinationExtras: [String: Any] = ["apiVersion": "v1", "kind": "Config"]
+        var destinationCurrentContext = ""
+
+        if manager.fileExists(atPath: destination.path) {
+            let existingText = try String(contentsOf: destination, encoding: .utf8)
+            let parsed = try parseKubeconfigText(existingText)
+            destinationContexts = parsed.contexts
+            destinationClusters = parsed.clusters
+            destinationUsers = parsed.users
+            destinationExtras = parsed.extras
+            destinationCurrentContext = parsed.currentContext
+        }
+
+        var importedClusters = imported.clusters
+        var importedUsers = imported.users
+        var importedContexts = imported.contexts
+
+        var usedClusterNames = Set(destinationClusters.map(\.name))
+        var clusterNameMap: [String: String] = [:]
+        for index in importedClusters.indices {
+            let oldName = importedClusters[index].name
+            let newName = makeUniqueName(base: oldName, used: &usedClusterNames)
+            importedClusters[index].name = newName
+            clusterNameMap[oldName] = newName
+        }
+
+        var usedUserNames = Set(destinationUsers.map(\.name))
+        var userNameMap: [String: String] = [:]
+        for index in importedUsers.indices {
+            let oldName = importedUsers[index].name
+            let newName = makeUniqueName(base: oldName, used: &usedUserNames)
+            importedUsers[index].name = newName
+            userNameMap[oldName] = newName
+        }
+
+        var usedContextNames = Set(destinationContexts.map(\.name))
+        var contextNameMap: [String: String] = [:]
+        for index in importedContexts.indices {
+            let oldName = importedContexts[index].name
+            let newName = makeUniqueName(base: oldName, used: &usedContextNames)
+            importedContexts[index].name = newName
+            contextNameMap[oldName] = newName
+
+            let oldClusterRef = importedContexts[index].fieldValue("cluster")
+            if let mappedCluster = clusterNameMap[oldClusterRef], !oldClusterRef.isEmpty {
+                importedContexts[index].setField("cluster", value: mappedCluster)
+            }
+            let oldUserRef = importedContexts[index].fieldValue("user")
+            if let mappedUser = userNameMap[oldUserRef], !oldUserRef.isEmpty {
+                importedContexts[index].setField("user", value: mappedUser)
+            }
+        }
+
+        destinationClusters.append(contentsOf: importedClusters)
+        destinationUsers.append(contentsOf: importedUsers)
+        destinationContexts.append(contentsOf: importedContexts)
+
+        if destinationCurrentContext.isEmpty {
+            destinationCurrentContext = contextNameMap[imported.currentContext] ?? importedContexts.first?.name ?? ""
+        }
+
+        var output = destinationExtras
+        output["apiVersion"] = output["apiVersion"] ?? "v1"
+        output["kind"] = output["kind"] ?? "Config"
+        output["current-context"] = destinationCurrentContext
+        output["contexts"] = encodeNamedItems(items: destinationContexts, nestedKey: "context")
+        output["clusters"] = encodeNamedItems(items: destinationClusters, nestedKey: "cluster")
+        output["users"] = encodeNamedItems(items: destinationUsers, nestedKey: "user")
+
+        let yaml = try Yams.dump(object: output)
+        try yaml.write(to: destination, atomically: true, encoding: .utf8)
+        statusMessage = "Merged kubeconfig into \(destination.path)"
+        return destination
+    }
+
+    public func fetchClusterNamespaces(contextID: UUID?) async throws -> [String] {
+        let contextName = try resolveContextName(contextID: contextID)
+        let kubeconfigPath = (currentPath ?? defaultKubeconfigURL).path
+        let command = [
+            "kubectl",
+            "--kubeconfig", kubeconfigPath,
+            "--context", contextName,
+            "get", "namespaces",
+            "-o", "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}"
+        ]
+
+        let runner = externalCommandRunner
+        let result = await Task.detached(priority: .userInitiated) {
+            runner(command)
+        }.value
+
+        guard result.exitCode == 0 else {
+            let details = result.stderr.isEmpty ? result.stdout : result.stderr
+            throw NSError(
+                domain: "KubeconfigEditor",
+                code: 1054,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to fetch namespaces: \(details.isEmpty ? "unknown error" : details)"]
+            )
+        }
+
+        return parseLineList(result.stdout)
+    }
+
+    public func fetchClusterServiceAccounts(contextID: UUID?, namespace: String) async throws -> [String] {
+        let cleanNamespace = namespace.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanNamespace.isEmpty else {
+            throw NSError(domain: "KubeconfigEditor", code: 1055, userInfo: [NSLocalizedDescriptionKey: "Namespace is required"])
+        }
+
+        let contextName = try resolveContextName(contextID: contextID)
+        let kubeconfigPath = (currentPath ?? defaultKubeconfigURL).path
+        let command = [
+            "kubectl",
+            "--kubeconfig", kubeconfigPath,
+            "--context", contextName,
+            "-n", cleanNamespace,
+            "get", "serviceaccounts",
+            "-o", "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}"
+        ]
+
+        let runner = externalCommandRunner
+        let result = await Task.detached(priority: .userInitiated) {
+            runner(command)
+        }.value
+
+        guard result.exitCode == 0 else {
+            let details = result.stderr.isEmpty ? result.stdout : result.stderr
+            throw NSError(
+                domain: "KubeconfigEditor",
+                code: 1056,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to fetch serviceaccounts: \(details.isEmpty ? "unknown error" : details)"]
+            )
+        }
+
+        return parseLineList(result.stdout)
     }
 
     public func deleteSelected() {
@@ -2138,6 +2418,28 @@ public final class KubeConfigViewModel: ObservableObject {
             currentContext: root["current-context"] as? String ?? "",
             extras: extras
         )
+    }
+
+    private func resolveContextName(contextID: UUID?) throws -> String {
+        if let contextID, let explicit = contexts.first(where: { $0.id == contextID })?.name, !explicit.isEmpty {
+            return explicit
+        }
+        if !currentContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return currentContext
+        }
+        if let first = contexts.first?.name, !first.isEmpty {
+            return first
+        }
+        throw NSError(domain: "KubeconfigEditor", code: 1057, userInfo: [NSLocalizedDescriptionKey: "Context not found"])
+    }
+
+    private func parseLineList(_ text: String) -> [String] {
+        let values = text
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        return Array(Set(values))
+            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
     }
 
     private func replaceLocalhostServer(in clusters: [NamedItem], with replacementHost: String) -> [NamedItem] {

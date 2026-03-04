@@ -10,4 +10,4 @@ DerivedData/
 /.build-local
 /.cache-*
 /(A Document Being Saved By swift-build*)
-/.vscode/launch.json
+/.vscode

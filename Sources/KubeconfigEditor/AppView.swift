@@ -60,6 +60,17 @@ struct AppView: View {
     @State private var oidcSetupMessage = ""
     @State private var oidcReauthContextID: UUID?
     @State private var isOIDCReauthInProgress = false
+    @State private var showServiceAccountKubeconfigSheet = false
+    @State private var serviceAccountName = ""
+    @State private var serviceAccountNamespace = "kube-system"
+    @State private var serviceAccountDuration = "8760h"
+    @State private var serviceAccountKubeconfigText = ""
+    @State private var serviceAccountMessage = ""
+    @State private var isGeneratingServiceAccountKubeconfig = false
+    @State private var availableServiceAccountNamespaces: [String] = []
+    @State private var availableServiceAccounts: [String] = []
+    @State private var isLoadingServiceAccountNamespaces = false
+    @State private var isLoadingServiceAccounts = false
 
     var body: some View {
         NavigationSplitView {
@@ -326,6 +337,28 @@ struct AppView: View {
             )
             .frame(minWidth: 840, minHeight: 540)
         }
+        .sheet(isPresented: $showServiceAccountKubeconfigSheet) {
+            ServiceAccountKubeconfigSheet(
+                serviceAccountName: $serviceAccountName,
+                namespace: $serviceAccountNamespace,
+                duration: $serviceAccountDuration,
+                kubeconfigText: $serviceAccountKubeconfigText,
+                message: $serviceAccountMessage,
+                isGenerating: isGeneratingServiceAccountKubeconfig,
+                availableNamespaces: availableServiceAccountNamespaces,
+                availableServiceAccounts: availableServiceAccounts,
+                isLoadingNamespaces: isLoadingServiceAccountNamespaces,
+                isLoadingServiceAccounts: isLoadingServiceAccounts,
+                onGenerate: { generateServiceAccountKubeconfig() },
+                onRefreshNamespaces: { refreshServiceAccountNamespaces() },
+                onRefreshServiceAccounts: { refreshServiceAccountsForSelectedNamespace() },
+                onNamespacePicked: { refreshServiceAccountsForSelectedNamespace() },
+                onSaveToFile: { saveServiceAccountKubeconfigToFile() },
+                onAddToMyKubeconfig: { addServiceAccountKubeconfigToDefault() },
+                onClose: { showServiceAccountKubeconfigSheet = false }
+            )
+            .frame(minWidth: 1000, minHeight: 700)
+        }
     }
 
     private var sidebar: some View {
@@ -500,6 +533,10 @@ struct AppView: View {
             }
 
             Spacer()
+
+            Button("Generate kubeconfig for SA") {
+                openServiceAccountKubeconfigSheet()
+            }
 
             Menu("History") {
                 Button("Undo Last Change") { viewModel.undoLastChange() }
@@ -1016,6 +1053,129 @@ struct AppView: View {
                 try await viewModel.triggerOIDCReauth(contextID: contextID)
             } catch {
                 viewModel.statusMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func openServiceAccountKubeconfigSheet() {
+        serviceAccountMessage = "Select context, set ServiceAccount parameters and click Generate."
+        availableServiceAccountNamespaces = []
+        availableServiceAccounts = []
+        showServiceAccountKubeconfigSheet = true
+        refreshServiceAccountNamespaces()
+    }
+
+    private func generateServiceAccountKubeconfig() {
+        guard !isGeneratingServiceAccountKubeconfig else { return }
+        isGeneratingServiceAccountKubeconfig = true
+        serviceAccountMessage = "Generating token and kubeconfig..."
+        let contextID = selectedContextId()
+        Task {
+            defer { isGeneratingServiceAccountKubeconfig = false }
+            do {
+                let yaml = try await viewModel.generateServiceAccountKubeconfig(
+                    contextID: contextID,
+                    serviceAccount: serviceAccountName,
+                    namespace: serviceAccountNamespace,
+                    duration: serviceAccountDuration
+                )
+                serviceAccountKubeconfigText = yaml
+                serviceAccountMessage = "Kubeconfig generated. You can edit it before saving or merging."
+            } catch {
+                serviceAccountMessage = "Generation error: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func saveServiceAccountKubeconfigToFile() {
+        let trimmed = serviceAccountKubeconfigText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            serviceAccountMessage = "Generate kubeconfig first."
+            return
+        }
+
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = []
+        panel.allowsOtherFileTypes = true
+        panel.directoryURL = viewModel.defaultKubeDirectoryURL
+
+        let safeSA = serviceAccountName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "service-account" : serviceAccountName
+        panel.nameFieldStringValue = "\(safeSA).kubeconfig"
+
+        if panel.runModal() == .OK, let url = panel.url {
+            do {
+                try serviceAccountKubeconfigText.write(to: url, atomically: true, encoding: .utf8)
+                serviceAccountMessage = "Saved: \(url.path)"
+            } catch {
+                serviceAccountMessage = "Save error: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func addServiceAccountKubeconfigToDefault() {
+        let trimmed = serviceAccountKubeconfigText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            serviceAccountMessage = "Generate kubeconfig first."
+            return
+        }
+
+        do {
+            let destination = try viewModel.mergeKubeconfigTextIntoDefault(serviceAccountKubeconfigText)
+            serviceAccountMessage = "Added to \(destination.path)"
+        } catch {
+            serviceAccountMessage = "Merge error: \(error.localizedDescription)"
+        }
+    }
+
+    private func refreshServiceAccountNamespaces() {
+        guard !isLoadingServiceAccountNamespaces else { return }
+        isLoadingServiceAccountNamespaces = true
+        serviceAccountMessage = "Loading namespaces from cluster API..."
+        let contextID = selectedContextId()
+        Task {
+            defer { isLoadingServiceAccountNamespaces = false }
+            do {
+                let namespaces = try await viewModel.fetchClusterNamespaces(contextID: contextID)
+                availableServiceAccountNamespaces = namespaces
+
+                if !namespaces.contains(serviceAccountNamespace) {
+                    if let kubeSystem = namespaces.first(where: { $0 == "kube-system" }) {
+                        serviceAccountNamespace = kubeSystem
+                    } else if let first = namespaces.first {
+                        serviceAccountNamespace = first
+                    }
+                }
+
+                serviceAccountMessage = "Namespaces loaded: \(namespaces.count)"
+                refreshServiceAccountsForSelectedNamespace()
+            } catch {
+                serviceAccountMessage = "Namespaces fetch error: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func refreshServiceAccountsForSelectedNamespace() {
+        guard !isLoadingServiceAccounts else { return }
+        let namespace = serviceAccountNamespace.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !namespace.isEmpty else {
+            serviceAccountMessage = "Namespace is required to load serviceaccounts"
+            return
+        }
+
+        isLoadingServiceAccounts = true
+        serviceAccountMessage = "Loading serviceaccounts for namespace '\(namespace)'..."
+        let contextID = selectedContextId()
+        Task {
+            defer { isLoadingServiceAccounts = false }
+            do {
+                let accounts = try await viewModel.fetchClusterServiceAccounts(contextID: contextID, namespace: namespace)
+                availableServiceAccounts = accounts
+                if !accounts.contains(serviceAccountName), let first = accounts.first {
+                    serviceAccountName = first
+                }
+                serviceAccountMessage = "ServiceAccounts loaded: \(accounts.count) in namespace '\(namespace)'"
+            } catch {
+                serviceAccountMessage = "ServiceAccounts fetch error: \(error.localizedDescription)"
             }
         }
     }
@@ -1913,6 +2073,127 @@ struct AwsEksQuickAddSheet: View {
             }
         }
         .padding(16)
+    }
+}
+
+struct ServiceAccountKubeconfigSheet: View {
+    @Binding var serviceAccountName: String
+    @Binding var namespace: String
+    @Binding var duration: String
+    @Binding var kubeconfigText: String
+    @Binding var message: String
+
+    let isGenerating: Bool
+    let availableNamespaces: [String]
+    let availableServiceAccounts: [String]
+    let isLoadingNamespaces: Bool
+    let isLoadingServiceAccounts: Bool
+    var onGenerate: () -> Void
+    var onRefreshNamespaces: () -> Void
+    var onRefreshServiceAccounts: () -> Void
+    var onNamespacePicked: () -> Void
+    var onSaveToFile: () -> Void
+    var onAddToMyKubeconfig: () -> Void
+    var onClose: () -> Void
+
+    private var filteredNamespaces: [String] {
+        filter(availableNamespaces, by: namespace)
+    }
+
+    private var filteredServiceAccounts: [String] {
+        filter(availableServiceAccounts, by: serviceAccountName)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Generate Kubeconfig for ServiceAccount")
+                    .font(.title3)
+                Spacer()
+                Button("Close") { onClose() }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.cancelAction)
+            }
+
+            Divider()
+
+            GroupBox("Parameters") {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 10) {
+                        TextField("Namespace", text: $namespace)
+                            .onChange(of: namespace) { newValue in
+                                if availableNamespaces.contains(where: { $0 == newValue }) {
+                                    onNamespacePicked()
+                                }
+                            }
+                        Menu("Pick Namespace (\(filteredNamespaces.count))") {
+                            ForEach(filteredNamespaces.prefix(100), id: \.self) { candidate in
+                                Button(candidate) {
+                                    namespace = candidate
+                                    onNamespacePicked()
+                                }
+                            }
+                        }
+                        .disabled(filteredNamespaces.isEmpty)
+                        Button(isLoadingNamespaces ? "Loading..." : "Refresh") {
+                            onRefreshNamespaces()
+                        }
+                        .disabled(isLoadingNamespaces)
+                    }
+
+                    HStack(spacing: 10) {
+                        TextField("ServiceAccount name", text: $serviceAccountName)
+                        Menu("Pick ServiceAccount (\(filteredServiceAccounts.count))") {
+                            ForEach(filteredServiceAccounts.prefix(100), id: \.self) { candidate in
+                                Button(candidate) {
+                                    serviceAccountName = candidate
+                                }
+                            }
+                        }
+                        .disabled(filteredServiceAccounts.isEmpty)
+                        Button(isLoadingServiceAccounts ? "Loading..." : "Refresh") {
+                            onRefreshServiceAccounts()
+                        }
+                        .disabled(isLoadingServiceAccounts)
+                    }
+
+                    TextField("Duration (e.g. 8760h)", text: $duration)
+                }
+                .textFieldStyle(.roundedBorder)
+            }
+
+            GroupBox("Generated kubeconfig (editable)") {
+                TextEditor(text: $kubeconfigText)
+                    .font(.system(.body, design: .monospaced))
+                    .frame(minHeight: 420)
+                    .border(.quaternary)
+            }
+
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(message.lowercased().contains("error") ? .red : .secondary)
+
+            HStack {
+                Button("Generate") { onGenerate() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(isGenerating)
+
+                Button("Save to File") { onSaveToFile() }
+                    .disabled(kubeconfigText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                Button("Add to My Kubeconfig") { onAddToMyKubeconfig() }
+                    .disabled(kubeconfigText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                Spacer()
+            }
+        }
+        .padding(16)
+    }
+
+    private func filter(_ source: [String], by query: String) -> [String] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return source }
+        return source.filter { $0.localizedCaseInsensitiveContains(trimmed) }
     }
 }
 

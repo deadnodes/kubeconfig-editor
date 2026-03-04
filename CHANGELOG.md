@@ -4,6 +4,21 @@ All notable changes to this project are documented in this file.
 
 The format follows Keep a Changelog and semantic versioning.
 
+## [0.0.14] - 2026-03-04
+
+### Added
+- Added `Generate kubeconfig for SA` action in the top toolbar near `History`.
+- Added dedicated ServiceAccount kubeconfig modal with editable generated YAML and actions: `Save to File` and `Add to My Kubeconfig`.
+- Added cluster-backed lookup for `namespaces` and `serviceaccounts` (using selected context) with search, pick menus, and refresh actions in the SA modal.
+
+### Changed
+- ServiceAccount kubeconfig generation is now native in app logic (`kubectl create token` + current cluster/context data) and no longer depends on external kubeconfig view plugins.
+- Introduced injectable external command runner in `KubeConfigViewModel` to support deterministic testing of command-based flows.
+
+### Fixed
+- Added tests for ServiceAccount kubeconfig generation success path (command arguments + YAML content assertions).
+- Added tests for ServiceAccount kubeconfig generation failure path (kubectl error propagation).
+
 ## [0.0.13] - 2026-03-02
 
 ### Added

@@ -529,6 +529,70 @@ struct KubeConfigViewModelTests {
         }
     }
 
+    @Test("generate serviceaccount kubeconfig builds token command and returns yaml")
+    func generateServiceAccountKubeconfigBuildsCommandAndReturnsYAML() async throws {
+        let capture = CommandCapture()
+        let tempDir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let vm = KubeConfigViewModel(externalCommandRunner: { args in
+            capture.append(args)
+            return (exitCode: 0, stdout: "token-from-mock", stderr: "")
+        })
+
+        let file = try writeFixture(dir: tempDir, named: "sa.yaml", content: fixtureYAML)
+        try vm.load(from: file)
+
+        let contextID = try #require(vm.contexts.first(where: { $0.name == "ctx-2" })?.id)
+        let yaml = try await vm.generateServiceAccountKubeconfig(
+            contextID: contextID,
+            serviceAccount: "azuredevops",
+            namespace: "kube-system",
+            duration: "8760h"
+        )
+
+        let args = try #require(capture.last())
+        #expect(args.first == "kubectl")
+        #expect(args.contains("--kubeconfig"))
+        #expect(args.contains(file.path))
+        #expect(args.contains("--context"))
+        #expect(args.contains("ctx-2"))
+        #expect(args.contains("create"))
+        #expect(args.contains("token"))
+        #expect(args.contains("azuredevops"))
+        #expect(args.contains("-n"))
+        #expect(args.contains("kube-system"))
+        #expect(args.contains("--duration=8760h"))
+
+        #expect(yaml.contains("current-context: ctx-2-azuredevops"))
+        #expect(yaml.contains("name: sa-kube-system-azuredevops"))
+        #expect(yaml.contains("token: token-from-mock"))
+        #expect(yaml.contains("namespace: kube-system"))
+        #expect(yaml.contains("server: https://10.0.0.2:6443"))
+    }
+
+    @Test("generate serviceaccount kubeconfig propagates kubectl errors")
+    func generateServiceAccountKubeconfigPropagatesKubectlError() async throws {
+        let tempDir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let vm = KubeConfigViewModel(externalCommandRunner: { _ in
+            (exitCode: 1, stdout: "", stderr: "forbidden: cannot create token")
+        })
+
+        let file = try writeFixture(dir: tempDir, named: "sa-fail.yaml", content: fixtureYAML)
+        try vm.load(from: file)
+
+        await #expect(throws: NSError.self) {
+            _ = try await vm.generateServiceAccountKubeconfig(
+                contextID: vm.contexts.first?.id,
+                serviceAccount: "azuredevops",
+                namespace: "kube-system",
+                duration: "8760h"
+            )
+        }
+    }
+
     @Test("version compare handles semantic parts")
     func versionComparisonHandlesSemanticParts() {
         #expect(isVersion("1.2.4", newerThan: "1.2.3"))
@@ -677,4 +741,21 @@ private func isVersion(_ lhs: String, newerThan rhs: String) -> Bool {
         if lv != rv { return lv > rv }
     }
     return false
+}
+
+private final class CommandCapture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var commands: [[String]] = []
+
+    func append(_ command: [String]) {
+        lock.lock()
+        commands.append(command)
+        lock.unlock()
+    }
+
+    func last() -> [String]? {
+        lock.lock()
+        defer { lock.unlock() }
+        return commands.last
+    }
 }
